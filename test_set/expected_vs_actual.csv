@@ -1,0 +1,10 @@
+label,file,ground_truth_mm,ground_truth_method,expected_decision,actual_diameter_mm,actual_decision,abs_error_mm,notes
+Real ring A,real_ring_A_IMG_9783.jpg,~17 (ruler),ruler (coarse),ACCEPT,16.80,ACCEPT,not precisely scoreable,ruler too coarse for sub-mm ground truth; steel ring photographed at a mild angle
+Real ring B,real_ring_B_IMG_9784.jpg,27,ruler,ACCEPT,26.47,ACCEPT,0.53,keyring-style ring; outside standard US finger-ring size range (flagged in_range=false)
+Synthetic clean baseline,synth_clean_baseline.png,17.40,rendered ground truth,ACCEPT,17.36,ACCEPT,0.04,
+Synthetic specular highlight,synth_specular_highlight.png,17.40,rendered ground truth,ACCEPT,17.40,ACCEPT,0.001,bright glare arc across the inner edge
+Synthetic shadow gradient,synth_shadow_gradient.png,17.40,rendered ground truth,ACCEPT,17.36,ACCEPT,0.04,directional lighting gradient across the ring
+Synthetic low contrast,synth_low_contrast_expect_retake.png,17.40,rendered ground truth,RETAKE,-,RETAKE (RING_NOT_FOUND),n/a,ring color ~6% contrast from background; correctly refuses rather than guessing
+Synthetic textured background,synth_textured_background.png,17.40,rendered ground truth,ACCEPT,17.36,ACCEPT,0.04,noisy wood-grain-like background texture
+Synthetic heavy blur,synth_heavy_blur_expect_retake.png,17.40,rendered ground truth,RETAKE,-,RETAKE (BLUR),n/a,rejected before any detection step (fast, cheap rejection path)
+Synthetic decoy object (adversarial),synth_decoy_object_adversarial.png,17.40,rendered ground truth,ACCEPT (ignore decoy),17.53,ACCEPT,0.13,second circular object (no matching concentric partner) placed in frame; must not be measured instead of the real ring
