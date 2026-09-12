@@ -72,8 +72,28 @@ def detect_and_rectify(photo):
     d = marker_corners_px
     top = np.linalg.norm(d[0]-d[1]); bottom = np.linalg.norm(d[3]-d[2])
     left = np.linalg.norm(d[0]-d[3]); right = np.linalg.norm(d[1]-d[2])
+
+    # Marker too small in frame: below this many px per side (in the
+    # ORIGINAL photo, before any rectification), ArUco corner localization
+    # gets noisy enough that the scale it hands the whole measurement
+    # becomes unreliable - a small pixel error in a small marker is a much
+    # bigger fraction of its size than the same pixel error on a large one.
+    # Both real validated test photos had marker sides ~430px; 80px is a
+    # conservative floor well below that, not a tight fit to them.
+    avg_side_px = (top+bottom+left+right) / 4
+    if avg_side_px < 80:
+        return None, None, "MARKER_TOO_SMALL"
+
     side_ratio = max(top,bottom,left,right) / max(1e-6, min(top,bottom,left,right))
-    if side_ratio > 1.8:
+    # Tightened from an earlier 1.8: that threshold was never empirically
+    # validated (see delivery notes) and let through more perspective
+    # distortion than a "near-overhead" photo should have. Both real
+    # validated photos had side_ratio ~1.01-1.02, so 1.35 still leaves
+    # generous headroom for a hand-held, not-perfectly-vertical shot while
+    # rejecting meaningfully steep angles. This is a reasoned tightening,
+    # not a re-calibration against a specific failing photo - revisit if a
+    # concrete steep-angle example is available to test against directly.
+    if side_ratio > 1.35:
         return None, None, "PERSPECTIVE_TOO_HIGH"
 
     dst_marker_px = np.float32([
@@ -121,6 +141,25 @@ def detect_and_rectify(photo):
     marker_rect_out = (dst_marker_px_shifted[0][0], dst_marker_px_shifted[0][1],
                         dst_marker_px_shifted[2][0], dst_marker_px_shifted[2][1])  # x0,y0,x1,y1
     return rectified, marker_rect_out, None
+
+def check_exposure(gray, dark_thresh=25, bright_thresh=250,
+                    max_dark_fraction=0.5, max_bright_fraction=0.15,
+                    min_mean=60, max_mean=235):
+    """Reject photos that are too dark or too washed-out to trust before
+    spending any time on marker/ring detection. Thresholds calibrated with
+    real working photos as the floor/ceiling to stay clear of: both real
+    test photos (evenly lit, indoor) measured mean brightness ~137,
+    frac_dark(<25) ~1%, frac_bright(>250) ~0.01-0.04% - comfortably inside
+    these bounds. Returns a reason string or None.
+    """
+    mean_b = gray.mean()
+    frac_dark = (gray < dark_thresh).mean()
+    frac_bright = (gray > bright_thresh).mean()
+    if mean_b < min_mean or frac_dark > max_dark_fraction:
+        return "UNDEREXPOSED"
+    if mean_b > max_mean or frac_bright > max_bright_fraction:
+        return "OVEREXPOSED"
+    return None
 
 def blur_score(gray):
     # normalize scale so metric is comparable across resolutions
@@ -485,6 +524,15 @@ def locate_outer_ring_circle(rect_gray, marker_rect):
 def measure_ring(photo, verbose_name=""):
     res = MeasurementResult()
     gray_full = cv2.cvtColor(photo, cv2.COLOR_BGR2GRAY)
+
+    # Cheap whole-photo checks first, before any marker/ring detection work.
+    # If a photo critically fails one of these, there is no point (and real
+    # risk of a misleading result) in running the rest of the pipeline.
+    exposure_issue = check_exposure(gray_full)
+    if exposure_issue:
+        res.reason = exposure_issue
+        return res
+
     sharpness = blur_score(gray_full)
     if sharpness < 40:
         res.reason = "BLUR"
@@ -612,7 +660,11 @@ def measure_ring(photo, verbose_name=""):
 
     if spread > 1.0:   # mm -- families disagree too much, unreliable
         res.reason = "RING_EDGE_UNSTABLE"
-        res.diameter_mm = median
+        # Deliberately NOT setting res.diameter_mm here even though we have
+        # a median value: res.ok is False, and a number sitting on a
+        # "not ok" result is a landmine for any future code path that reads
+        # diameter_mm without checking ok first. detection_spread_mm is
+        # still useful to keep for diagnostics (it's WHY this was rejected).
         res.detection_spread_mm = spread
         return res
 

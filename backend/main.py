@@ -41,12 +41,15 @@ MARKER_PDF_PATH = os.path.join(BACKEND_DIR, "ring_marker_20mm.pdf")
 # contract (reason code) and the user-facing wording can change
 # independently - the frontend only needs to render `message`.
 RETAKE_MESSAGES = {
-    "MARKER_NOT_FOUND": "Calibration marker not detected. Make sure the whole marker is flat, unobstructed, and in the photo.",
-    "MARKER_PARTIAL": "The marker is too close to the edge of the photo. Leave more space around it and retake.",
-    "PERSPECTIVE_TOO_HIGH": "The camera angle is too steep. Take the photo more directly from above.",
-    "BLUR": "The photo is too blurry to measure accurately. Hold the camera steady and make sure the ring is in focus.",
-    "RING_NOT_FOUND": "Could not find a clear ring boundary. Make sure the ring lies flat, its hole is visible, and it contrasts with the background.",
-    "RING_EDGE_UNSTABLE": "The ring's inner edge could not be measured consistently. Try better, more even lighting and reduce reflections.",
+    "MARKER_NOT_FOUND": "Marker not detected. Make sure the whole marker is flat, unobstructed, and in the photo.",
+    "MARKER_PARTIAL": "Marker is not fully visible. Keep the entire marker inside the frame.",
+    "MARKER_TOO_SMALL": "Marker appears too small in the photo. Move the camera closer to the ring and marker.",
+    "PERSPECTIVE_TOO_HIGH": "Too much perspective. Take the photo more directly from above.",
+    "BLUR": "Photo is too blurry. Hold the phone steady and retake.",
+    "UNDEREXPOSED": "Photo is too dark. Move to a brighter area and retake.",
+    "OVEREXPOSED": "Photo is too bright or washed out. Reduce glare and retake in more even light.",
+    "RING_NOT_FOUND": "Ring edge is unclear. Avoid reflections and place the ring on a contrasting surface.",
+    "RING_EDGE_UNSTABLE": "Ring edge is unclear. Avoid reflections and place the ring on a contrasting surface.",
     "INCONSISTENT_DETECTION": "Detected more than one possible circular object. Make sure only one ring is in the photo, away from other round objects.",
 }
 DEFAULT_RETAKE_MESSAGE = "Could not get a reliable measurement from this photo. Please retake following the instructions."

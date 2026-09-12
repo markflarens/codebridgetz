@@ -4,9 +4,25 @@
   const screens = {};
   document.querySelectorAll("[data-screen]").forEach(el => { screens[el.id] = el; });
 
+  // Each screen has a matching fixed bottom "dock" of action button(s),
+  // shown/hidden together with it since docks live outside the scrolling
+  // screen sections (fixed position).
+  const DOCK_FOR_SCREEN = {
+    "screen-instructions": "dock-instructions",
+    "screen-capture": "dock-capture",
+    "screen-processing": null,
+    "screen-result": "dock-result",
+    "screen-retake": "dock-retake",
+  };
+
   function showScreen(id) {
     Object.values(screens).forEach(el => el.hidden = true);
+    Object.values(DOCK_FOR_SCREEN).forEach(dockId => {
+      if (dockId) document.getElementById(dockId).hidden = true;
+    });
     screens[id].hidden = false;
+    const dockId = DOCK_FOR_SCREEN[id];
+    if (dockId) document.getElementById(dockId).hidden = false;
     window.scrollTo({ top: 0, behavior: "instant" in window ? "instant" : "auto" });
   }
 
@@ -60,10 +76,10 @@
   const scanningImg = document.getElementById("scanning-img");
   const scannerStatus = document.getElementById("scanner-status");
   const STATUS_MESSAGES = [
-    "Locating calibration marker…",
+    "Locating marker…",
     "Correcting perspective…",
     "Scanning inner boundary…",
-    "Cross-checking detection methods…",
+    "Cross-checking methods…",
   ];
 
   function runStatusCycle() {
@@ -106,9 +122,23 @@
   });
 
   // ---------------- Screen 4: success ----------------
+  // Soft count-up animation for the headline number, instead of just
+  // snapping the text in - a small, purely cosmetic touch.
+  function animateValue(el, to, duration = 650) {
+    const start = performance.now();
+    function frame(now) {
+      const t = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - t, 3); // ease-out cubic
+      el.textContent = (to * eased).toFixed(2);
+      if (t < 1) requestAnimationFrame(frame);
+      else el.textContent = to.toFixed(2);
+    }
+    requestAnimationFrame(frame);
+  }
+
   function renderSuccess(data) {
     document.getElementById("result-overlay-img").src = data.overlay_image || "";
-    document.getElementById("reading-diameter").textContent = data.diameter_mm.toFixed(2);
+    animateValue(document.getElementById("reading-diameter"), data.diameter_mm);
     document.getElementById("reading-size").textContent = data.ring_size;
 
     const flag = document.getElementById("reading-size-flag");
@@ -117,7 +147,7 @@
     document.getElementById("data-spread").textContent = `± ${data.detection_spread_mm.toFixed(2)} mm`;
 
     const methods = Object.keys(data.family_estimates || {});
-    document.getElementById("data-methods").textContent = `${methods.length} (${methods.join(", ")})`;
+    document.getElementById("data-methods").textContent = `${methods.length}`;
 
     document.getElementById("data-time").textContent = `${(data.processing_time_ms / 1000).toFixed(1)} s`;
     document.getElementById("data-standard").textContent = data.sizing_standard;

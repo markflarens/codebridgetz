@@ -3,114 +3,113 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>Gauge — Ring Diameter Measurement</title>
+<title>Ring Size — Measure from a Photo</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
+<div class="glow-bg"></div>
 <div class="grain"></div>
-<div class="blueprint-grid"></div>
-
-<header class="topbar">
-  <div class="topbar__mark">
-    <span class="topbar__ring">◎</span>
-    <span class="topbar__word">GAUGE</span>
-  </div>
-  <div class="topbar__tag">RING&nbsp;DIAMETER&nbsp;INSTRUMENT</div>
-</header>
 
 <main id="app">
 
   <!-- ============ SCREEN 1: INSTRUCTIONS ============ -->
   <section class="screen" id="screen-instructions" data-screen>
     <div class="hero">
-      <h1 class="hero__title">Measure a ring<br>from a photo.</h1>
-      <p class="hero__subtitle">No calipers. No typing in numbers. Just the ring, a printed marker, and a camera held overhead.</p>
+      <h1 class="hero__title">Measure a ring<br>in seconds.</h1>
+      <p class="hero__subtitle">Just a photo — no tools, no typing.</p>
     </div>
 
     <ol class="steps">
       <li class="steps__item">
-        <span class="steps__num">01</span>
-        <div>
-          <h3>Print the marker</h3>
-          <p>Exactly 20&nbsp;×&nbsp;20&nbsp;mm. Print at <strong>100% / Actual Size</strong> — never "Fit to page".</p>
+        <span class="steps__num">1</span>
+        <div class="steps__body">
+          <div class="steps__row">
+            <h3>Print the marker</h3>
+            <a class="chip-link" href="/api/marker" download>
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 1v9m0 0L4.5 6.5M8 10l3.5-3.5M2 12.5v1a1 1 0 001 1h10a1 1 0 001-1v-1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              Download
+            </a>
+          </div>
+          <p>100% scale, never "Fit to page".</p>
         </div>
       </li>
       <li class="steps__item">
-        <span class="steps__num">02</span>
-        <div>
-          <h3>Verify the print</h3>
-          <p>Check the scale square on the printed page with a ruler. If it isn't exactly 20&nbsp;mm, reprint.</p>
+        <span class="steps__num">2</span>
+        <div class="steps__body">
+          <h3>Ruler-check it</h3>
+          <p>Confirm the printed square is exactly 20mm.</p>
         </div>
       </li>
       <li class="steps__item">
-        <span class="steps__num">03</span>
-        <div>
+        <span class="steps__num">3</span>
+        <div class="steps__body">
           <h3>Place them together</h3>
-          <p>Ring flat, marker beside it, same flat surface, marker fully visible.</p>
+          <p>Ring flat, marker beside it, same surface.</p>
         </div>
       </li>
       <li class="steps__item">
-        <span class="steps__num">04</span>
-        <div>
-          <h3>Shoot from directly above</h3>
-          <p>Sharp focus, even light, minimal glare. Steep angles and blur will be rejected.</p>
+        <span class="steps__num">4</span>
+        <div class="steps__body">
+          <h3>Shoot from above</h3>
+          <p>Sharp focus, even light, minimal glare.</p>
         </div>
       </li>
     </ol>
 
-    <div class="cta-row">
-      <a class="btn btn--ghost" href="/api/marker" download>
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 1v9m0 0L4.5 6.5M8 10l3.5-3.5M2 12.5v1a1 1 0 001 1h10a1 1 0 001-1v-1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Download Marker
-      </a>
-      <button class="btn btn--solid" id="btn-start">
-        Measure a Ring
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8h10m0 0L9 4m4 4L9 12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      </button>
-    </div>
-
-    <p class="supported-note">
-      <strong>Supported:</strong> one ring, one marker, same plane, near-overhead, sharp focus.<br>
-      <strong>Not yet supported:</strong> multiple rings, ring on a finger, steep angles, hidden marker.
-    </p>
+    <p class="fine-note">Works with one ring + one marker, laid flat, shot from overhead.</p>
   </section>
+
+  <div class="dock" id="dock-instructions">
+    <button class="btn btn--solid btn--full" id="btn-start">
+      Measure a Ring
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8h10m0 0L9 4m4 4L9 12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+  </div>
 
   <!-- ============ SCREEN 2: CAPTURE ============ -->
   <section class="screen" id="screen-capture" data-screen hidden>
-    <button class="back-link" data-back-to="screen-instructions">← Instructions</button>
-    <h2 class="screen__title">Add a photo</h2>
+    <button class="back-link" data-back-to="screen-instructions">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M10 3L5 8l5 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Back
+    </button>
 
     <div class="capture-frame" id="capture-frame">
+      <div class="capture-frame__glow"></div>
       <div class="capture-frame__corners">
         <span></span><span></span><span></span><span></span>
       </div>
       <img id="preview-img" alt="Selected photo preview" hidden>
       <div class="capture-frame__placeholder" id="capture-placeholder">
-        <svg width="40" height="40" viewBox="0 0 40 40" fill="none"><rect x="3" y="10" width="34" height="24" rx="3" stroke="currentColor" stroke-width="1.4"/><circle cx="20" cy="22" r="7" stroke="currentColor" stroke-width="1.4"/><path d="M14 10l2-4h8l2 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        <span>Ring + marker, near-overhead</span>
+        <svg width="36" height="36" viewBox="0 0 40 40" fill="none"><rect x="3" y="10" width="34" height="24" rx="6" stroke="currentColor" stroke-width="1.6"/><circle cx="20" cy="22" r="7" stroke="currentColor" stroke-width="1.6"/><path d="M14 10l2-4h8l2 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Ring + marker, from above</span>
       </div>
     </div>
 
     <input type="file" accept="image/*" capture="environment" id="input-camera" hidden>
     <input type="file" accept="image/*" id="input-gallery" hidden>
 
-    <div class="cta-row cta-row--stack">
-      <button class="btn btn--solid" id="btn-camera">
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="1" y="4" width="14" height="10" rx="1.5" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="9" r="2.8" stroke="currentColor" stroke-width="1.3"/><path d="M5.5 4l0.8-1.6h3.4L10.5 4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Take Photo
+    <div class="cta-row">
+      <button class="btn btn--soft" id="btn-camera">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="1" y="4" width="14" height="10" rx="2.5" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="9" r="2.8" stroke="currentColor" stroke-width="1.4"/><path d="M5.5 4l0.8-1.6h3.4L10.5 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Camera
       </button>
-      <button class="btn btn--ghost" id="btn-gallery">Choose from Gallery</button>
+      <button class="btn btn--soft" id="btn-gallery">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor" stroke-width="1.4"/><path d="M1.5 10.5l3.5-3.5 2.5 2.5 3-3 3.5 3.5" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><circle cx="5" cy="6" r="1.2" fill="currentColor"/></svg>
+        Gallery
+      </button>
     </div>
-
-    <button class="btn btn--analyze" id="btn-analyze" disabled>
-      Analyze Photo
-      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8h10m0 0L9 4m4 4L9 12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    </button>
   </section>
+
+  <div class="dock" id="dock-capture" hidden>
+    <button class="btn btn--solid btn--full" id="btn-analyze" disabled>
+      Analyze Photo
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8h10m0 0L9 4m4 4L9 12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+  </div>
 
   <!-- ============ SCREEN 3: PROCESSING ============ -->
   <section class="screen screen--center" id="screen-processing" data-screen hidden>
@@ -121,8 +120,7 @@
         <div class="scanner__corners"><span></span><span></span><span></span><span></span></div>
       </div>
     </div>
-    <p class="scanner__status" id="scanner-status">Locating calibration marker…</p>
-    <p class="scanner__hint">This runs entirely through geometric measurement — no guessing.</p>
+    <p class="scanner__status" id="scanner-status">Locating marker…</p>
   </section>
 
   <!-- ============ SCREEN 4: RESULT — SUCCESS ============ -->
@@ -137,62 +135,61 @@
         <span class="reading__unit">mm</span>
       </div>
       <div class="reading__size">
-        US Size <strong id="reading-size">—</strong>
+        Size <strong id="reading-size">—</strong>
         <span class="reading__size-flag" id="reading-size-flag"></span>
       </div>
     </div>
 
     <div class="datagrid">
       <div class="datagrid__cell">
-        <span class="datagrid__label">Cross-method spread</span>
+        <span class="datagrid__label">Spread</span>
         <span class="datagrid__value" id="data-spread">—</span>
       </div>
       <div class="datagrid__cell">
-        <span class="datagrid__label">Methods agreeing</span>
+        <span class="datagrid__label">Methods</span>
         <span class="datagrid__value" id="data-methods">—</span>
       </div>
       <div class="datagrid__cell">
-        <span class="datagrid__label">Processing time</span>
+        <span class="datagrid__label">Time</span>
         <span class="datagrid__value" id="data-time">—</span>
       </div>
       <div class="datagrid__cell">
-        <span class="datagrid__label">Sizing standard</span>
+        <span class="datagrid__label">Standard</span>
         <span class="datagrid__value datagrid__value--small" id="data-standard">—</span>
       </div>
     </div>
 
     <details class="disclosure">
-      <summary>What "cross-method spread" means</summary>
-      <p>This is how much independent detection methods disagreed on this photo — not a full measurement-uncertainty estimate. It doesn't yet account for print scale error, lens distortion, or lighting. Treat it as a stability signal, not a lab-grade error bar.</p>
+      <summary>What "spread" means</summary>
+      <p>How much independent detection methods disagreed — a stability signal, not a full accuracy estimate.</p>
     </details>
 
     <details class="disclosure">
-      <summary>Sizing source &amp; rounding rule</summary>
+      <summary>Sizing source</summary>
       <p id="data-source"></p>
       <p id="data-rounding"></p>
     </details>
-
-    <div class="cta-row">
-      <button class="btn btn--ghost" id="btn-retry-success">Measure Another</button>
-    </div>
   </section>
+
+  <div class="dock" id="dock-result" hidden>
+    <button class="btn btn--soft btn--full" id="btn-retry-success">Measure Another</button>
+  </div>
 
   <!-- ============ SCREEN 5: RESULT — RETAKE ============ -->
   <section class="screen screen--center" id="screen-retake" data-screen hidden>
     <div class="retake-mark">✕</div>
-    <h2 class="retake-title">Couldn't measure this photo</h2>
-    <p class="retake-reason-code" id="retake-code">—</p>
     <p class="retake-message" id="retake-message">—</p>
+    <p class="retake-reason-code" id="retake-code">—</p>
 
     <div class="result-overlay-wrap result-overlay-wrap--small" id="retake-overlay-wrap" hidden>
       <img id="retake-overlay-img" alt="Detection debug overlay">
     </div>
-
-    <div class="cta-row cta-row--stack">
-      <button class="btn btn--solid" id="btn-retry-retake">Try Another Photo</button>
-      <button class="back-link back-link--standalone" data-back-to="screen-instructions">Review instructions</button>
-    </div>
   </section>
+
+  <div class="dock dock--stack" id="dock-retake" hidden>
+    <button class="btn btn--solid btn--full" id="btn-retry-retake">Try Another Photo</button>
+    <button class="back-link back-link--standalone" data-back-to="screen-instructions">Review instructions</button>
+  </div>
 
 </main>
 
