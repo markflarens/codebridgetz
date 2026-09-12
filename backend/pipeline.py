@@ -294,33 +294,11 @@ def radial_inner_candidate(gray_for_gradient, edge_map, center, outer_radius_px,
                            max_band_ratio=1.8,
                            min_support=0.03,
                            min_prominence=1.25,
-                           gradient_angle_tolerance_deg=20,
-                           trim_outer_edge_px=0):
+                           gradient_angle_tolerance_deg=20):
     """
     Fallback for real metal rings where reflections/shadows break the
     boundary into arcs and findContours() cannot produce a clean closed
     contour.
-
-    trim_outer_edge_px: default 0 (no change from the original behavior).
-    This function is called from two different places with two different
-    needs, and conflating them once already caused a regression - keep
-    them separate:
-
-    1. locate_outer_ring_circle() calls this with the default (0) purely
-       as a validity CHECK on a candidate Hough circle ("does this look
-       like it has ring-band structure at all"). That call's behavior
-       must stay exactly as originally calibrated, because changing it
-       changes which Hough circle gets selected as the outer boundary in
-       the first place - confirmed by direct regression: trimming
-       unconditionally here changed the selected outer circle for
-       real_ring_A/B (their validated, correct outer hint depends on this
-       exact untrimmed check) and silently corrupted their final
-       measurements even though their diameter never came from this
-       trimmed code path directly.
-    2. measure_ring() (via _attempt_measurement)'s second, rescue-only
-       attempt passes trim_outer_edge_px=20 to recover a distinct failure
-       mode - see measure_ring's own comments for why that's safe (it
-       only runs after the untrimmed attempt has already failed).
 
     CRITICAL FIX (found on a real photo of a ring on a wood table):
     counting ALL edge pixels in the radius band, regardless of direction,
@@ -402,49 +380,15 @@ def radial_inner_candidate(gray_for_gradient, edge_map, center, outer_radius_px,
     if hist.size == 0:
         return None
 
-    # --- Trim the search band's OUTER edge before picking the peak. ---
-    # Only applied when the caller passes trim_outer_edge_px > 0 (see the
-    # docstring above for why the validation call must NOT do this).
-    #
-    # BUG FOUND on a real reflective keyring photo: the true OUTER
-    # boundary sits just outside [r_min, r_max] (by construction - r_max
-    # is derived from the outer radius itself), but its edge is not a
-    # clean single-pixel line - antialiasing/blur/specular halo around it
-    # spreads edge pixels inward for ~10-20px. That produces a count that
-    # ramps UP monotonically right up to r_max, peaking in the last 1-2
-    # bins before the window cuts off. argmax over the raw histogram
-    # picked that cutoff-adjacent bin - not because it's a true local
-    # maximum, but because the window truncated the ramp before it could
-    # turn over. That produced a diameter within ~1mm of the OUTER edge,
-    # misread as the inner one.
-    #
-    # This same near-boundary shape is NOT always an artifact: on
-    # real_ring_B, the genuinely correct inner peak sits only 1-3px from
-    # r_max (that ring's wall happens to be thin), so trimming cannot be
-    # unconditional - see measure_ring's two-attempt strategy, which only
-    # invokes this trim as a rescue after the untrimmed attempt fails.
-    trimmed_r_max = r_max
-    if trim_outer_edge_px > 0:
-        candidate_trim = r_max - trim_outer_edge_px
-        if candidate_trim > r_min:
-            trimmed_r_max = candidate_trim
-        # else: band too narrow to trim safely - fall back to untrimmed
-    trimmed_hist = hist[:(trimmed_r_max - r_min + 1)]
-    if trimmed_hist.size == 0:
-        return None
-
-    peak_idx = int(np.argmax(trimmed_hist))
+    peak_idx = int(np.argmax(hist))
     radius = float(r_min + peak_idx)
-    peak = float(trimmed_hist[peak_idx])
+    peak = float(hist[peak_idx])
 
     # Approximate fraction of the circumference supported by edge pixels.
     support = peak / max(1.0, 2.0 * np.pi * radius)
 
     # Reject broad/noisy radial distributions from wood grain/background.
-    # Baseline uses the same (possibly trimmed) range as the peak search -
-    # using the untrimmed hist here would let the outer-edge truncation
-    # ramp inflate the baseline and mask a genuine peak.
-    baseline = float(np.percentile(trimmed_hist, 75))
+    baseline = float(np.percentile(hist, 75))
     prominence = peak / max(1.0, baseline)
 
     if support < min_support:
@@ -593,13 +537,47 @@ def locate_outer_ring_circle(rect_gray, marker_rect):
 
     return best[1]
 
-def _attempt_measurement(rectified, rect_gray, variants, outer_ring_hint, trim_outer_edge_px):
-    """One full measurement attempt (candidate search -> family aggregation
-    -> consensus checks), parameterized by trim_outer_edge_px so measure_ring
-    can retry with a different radial-fallback strategy without duplicating
-    this logic (see measure_ring for why there are two attempts).
-    """
+def measure_ring(photo, verbose_name=""):
     res = MeasurementResult()
+    gray_full = cv2.cvtColor(photo, cv2.COLOR_BGR2GRAY)
+
+    # Cheap whole-photo checks first, before any marker/ring detection work.
+    # If a photo critically fails one of these, there is no point (and real
+    # risk of a misleading result) in running the rest of the pipeline.
+    exposure_issue = check_exposure(gray_full)
+    if exposure_issue:
+        res.reason = exposure_issue
+        return res
+
+    sharpness = blur_score(gray_full)
+    if sharpness < 40:
+        res.reason = "BLUR"
+        return res
+
+    rectified, marker_rect, err = detect_and_rectify(photo)
+    if err:
+        res.reason = err
+        return res
+
+    rect_gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
+    mx0, my0, mx1, my1 = marker_rect
+    mask = np.ones_like(rect_gray)*255
+    pad = MARKER_MASK_PAD_PX
+    cv2.rectangle(mask, (int(mx0-pad), int(my0-pad)), (int(mx1+pad), int(my1+pad)), 0, -1)
+
+    variants = segmentation_candidates(rect_gray, mask)
+
+    # Real-photo fallback localization.
+    #
+    # The existing contour-based detector remains the PRIMARY path because
+    # it is precise when clean closed contours exist.
+    #
+    # Hough/radial detection is only used when that primary detector cannot
+    # obtain a valid inner+outer contour pair.
+    outer_ring_hint = locate_outer_ring_circle(
+        rect_gray,
+        marker_rect
+    )
 
     diam_candidates = []
     dbg = rectified.copy()
@@ -619,8 +597,7 @@ def _attempt_measurement(rectified, rect_gray, variants, outer_ring_hint, trim_o
                 rect_gray,
                 edge_map,
                 (outer_cx, outer_cy),
-                outer_radius,
-                trim_outer_edge_px=trim_outer_edge_px
+                outer_radius
             )
 
         if cand is None:
@@ -710,88 +687,4 @@ def _attempt_measurement(rectified, rect_gray, variants, outer_ring_hint, trim_o
     res.ok = True
     res.diameter_mm = median
     res.detection_spread_mm = max(spread, 0.05)  # floor so we never claim impossible precision
-    return res
-
-
-def measure_ring(photo, verbose_name=""):
-    res = MeasurementResult()
-    gray_full = cv2.cvtColor(photo, cv2.COLOR_BGR2GRAY)
-
-    # Cheap whole-photo checks first, before any marker/ring detection work.
-    # If a photo critically fails one of these, there is no point (and real
-    # risk of a misleading result) in running the rest of the pipeline.
-    exposure_issue = check_exposure(gray_full)
-    if exposure_issue:
-        res.reason = exposure_issue
-        return res
-
-    sharpness = blur_score(gray_full)
-    if sharpness < 40:
-        res.reason = "BLUR"
-        return res
-
-    rectified, marker_rect, err = detect_and_rectify(photo)
-    if err:
-        res.reason = err
-        return res
-
-    rect_gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
-    mx0, my0, mx1, my1 = marker_rect
-    mask = np.ones_like(rect_gray)*255
-    pad = MARKER_MASK_PAD_PX
-    cv2.rectangle(mask, (int(mx0-pad), int(my0-pad)), (int(mx1+pad), int(my1+pad)), 0, -1)
-
-    variants = segmentation_candidates(rect_gray, mask)
-
-    # Real-photo fallback localization.
-    #
-    # The existing contour-based detector remains the PRIMARY path because
-    # it is precise when clean closed contours exist.
-    #
-    # Hough/radial detection is only used when that primary detector cannot
-    # obtain a valid inner+outer contour pair.
-    outer_ring_hint = locate_outer_ring_circle(
-        rect_gray,
-        marker_rect
-    )
-
-    # --- Two-attempt strategy for the radial fallback (see _attempt_measurement). ---
-    #
-    # Attempt 1 uses the ORIGINAL, long-validated radial_inner_candidate
-    # behavior (trim_outer_edge_px=0) - this is exactly what both real
-    # validated test photos (real_ring_A, real_ring_B) already pass under,
-    # unchanged. Their true inner-boundary peak can legitimately sit within
-    # a few px of the search band's outer edge (confirmed by direct
-    # measurement: real_ring_B's correct 26.47mm peak sits ~1-3px from
-    # r_max), so trimming that zone unconditionally would silently corrupt
-    # them - this was tried and reverted (see delivery notes).
-    #
-    # Attempt 2 (trim_outer_edge_px=20) only runs when attempt 1 does NOT
-    # reach a confident result (RING_NOT_FOUND / RING_EDGE_UNSTABLE /
-    # INCONSISTENT_DETECTION). It exists for a distinct failure mode found
-    # on a real reflective keyring photo: several segmentation variants
-    # (canny at low thresholds, adaptive) picked up the blur/specular halo
-    # of the ring's OWN outer edge bleeding a few px inside the search
-    # window, mistaking it for the inner boundary and landing near 34-36mm,
-    # while the sharper-threshold canny variants still correctly found the
-    # true ~23.5mm inner peak - the resulting cross-variant disagreement
-    # was large enough to correctly trigger RING_EDGE_UNSTABLE, but the
-    # correct answer was recoverable by re-running with that halo zone
-    # excluded from the search.
-    #
-    # Because attempt 2 only fires when attempt 1 has already failed, it
-    # can never override or destabilize a photo that attempt 1 already
-    # measures confidently - it only gives a second, different chance to
-    # photos that would otherwise be a flat retake.
-    res = _attempt_measurement(rectified, rect_gray, variants, outer_ring_hint, trim_outer_edge_px=0)
-    if res.ok:
-        return res
-
-    rescue = _attempt_measurement(rectified, rect_gray, variants, outer_ring_hint, trim_outer_edge_px=20)
-    if rescue.ok:
-        return rescue
-
-    # Neither attempt produced a confident result - return attempt 1's
-    # failure (its reason/debug image are what the original, more heavily
-    # validated code path would have shown).
     return res
