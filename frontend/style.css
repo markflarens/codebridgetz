@@ -6,17 +6,18 @@
   --line-soft: rgba(255,255,255,0.05);
   --text: #f3f4f0;
   --text-dim: #8d8f8f;
-  --accent: #c8f24e;
-  --accent-2: #a3e635;
-  --accent-soft: rgba(200,242,78,0.14);
-  --accent-glow: rgba(200,242,78,0.35);
+  --accent: #da7756;
+  --accent-2: #cc6a49;
+  --accent-soft: rgba(218,119,86,0.16);
+  --accent-glow: rgba(218,119,86,0.4);
   --err: #ff6b5e;
   --err-soft: rgba(255,107,94,0.12);
   --font: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
-  --r-lg: 22px;
-  --r-md: 16px;
+  --r-lg: 20px;
+  --r-md: 14px;
   --r-sm: 10px;
+  --r-btn: 12px;
   --ease: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
@@ -54,8 +55,22 @@ body {
   z-index: 0;
   pointer-events: none;
   background:
-    radial-gradient(ellipse 60% 40% at 15% 0%, rgba(200,242,78,0.10), transparent 60%),
-    radial-gradient(ellipse 50% 35% at 100% 15%, rgba(200,242,78,0.06), transparent 60%);
+    radial-gradient(ellipse 60% 40% at 15% 0%, rgba(218,119,86,0.10), transparent 60%),
+    radial-gradient(ellipse 50% 35% at 100% 15%, rgba(218,119,86,0.06), transparent 60%);
+}
+
+.grid-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(var(--line-soft) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line-soft) 1px, transparent 1px);
+  background-size: 28px 28px;
+  -webkit-mask-image: radial-gradient(ellipse 80% 55% at 50% 0%, black 40%, transparent 90%);
+          mask-image: radial-gradient(ellipse 80% 55% at 50% 0%, black 40%, transparent 90%);
+  opacity: 0.6;
 }
 
 /* ---------- layout ---------- */
@@ -65,7 +80,7 @@ main#app {
   width: 100%;
   max-width: 460px;
   margin: 0 auto;
-  padding: 28px 20px 40px;
+  padding: calc(80px + env(safe-area-inset-top)) 20px 40px;
   min-height: 100vh;
 }
 
@@ -127,12 +142,6 @@ main#app {
   margin-top: 1px;
 }
 .steps__body { flex: 1; min-width: 0; }
-.steps__row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
 .steps__item h3 {
   font-size: 14.5px;
   font-weight: 600;
@@ -146,21 +155,13 @@ main#app {
   margin: 3px 0 0;
 }
 
-.chip-link {
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11px;
-  font-weight: 600;
+.text-link {
   color: var(--accent);
-  background: var(--accent-soft);
-  border-radius: 999px;
-  padding: 5px 10px;
-  text-decoration: none;
-  transition: background 0.2s var(--ease), transform 0.15s var(--ease);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
-.chip-link:active { transform: scale(0.94); }
+.text-link:active { opacity: 0.7; }
 
 .fine-note {
   font-size: 11.5px;
@@ -181,7 +182,7 @@ main#app {
   font-family: var(--font);
   font-size: 14px;
   font-weight: 600;
-  border-radius: 999px;
+  border-radius: var(--r-btn);
   padding: 15px 20px;
   display: inline-flex;
   align-items: center;
@@ -198,7 +199,7 @@ main#app {
 .btn--solid {
   background: var(--accent);
   color: #10140a;
-  box-shadow: 0 0 0 rgba(200,242,78,0);
+  box-shadow: 0 0 0 rgba(218,119,86,0);
 }
 .btn--solid:hover { box-shadow: 0 4px 24px var(--accent-glow); }
 .btn--solid:disabled {
@@ -271,14 +272,14 @@ main#app {
   position: absolute;
   inset: 0;
   border-radius: var(--r-lg);
-  box-shadow: 0 0 0 1.5px var(--line), inset 0 0 40px rgba(200,242,78,0.08);
+  box-shadow: 0 0 0 1.5px var(--line), inset 0 0 40px rgba(218,119,86,0.08);
   animation: breathe-glow 3.2s ease-in-out infinite;
   z-index: 1;
   pointer-events: none;
 }
 @keyframes breathe-glow {
-  0%, 100% { box-shadow: 0 0 0 1.5px var(--line), inset 0 0 40px rgba(200,242,78,0.06), 0 0 24px rgba(200,242,78,0.08); }
-  50%      { box-shadow: 0 0 0 1.5px var(--accent-2), inset 0 0 50px rgba(200,242,78,0.14), 0 0 32px rgba(200,242,78,0.22); }
+  0%, 100% { box-shadow: 0 0 0 1.5px var(--line), inset 0 0 40px rgba(218,119,86,0.06), 0 0 24px rgba(218,119,86,0.08); }
+  50%      { box-shadow: 0 0 0 1.5px var(--accent-2), inset 0 0 50px rgba(218,119,86,0.14), 0 0 32px rgba(218,119,86,0.22); }
 }
 
 .capture-frame img#preview-img {
@@ -322,7 +323,7 @@ main#app {
   overflow: hidden;
   background: var(--card);
   margin: 0 auto 26px;
-  box-shadow: 0 0 40px rgba(200,242,78,0.18);
+  box-shadow: 0 0 40px rgba(218,119,86,0.18);
 }
 .scanner__frame img {
   width: 100%;
@@ -334,7 +335,7 @@ main#app {
   position: absolute;
   left: 0; right: 0;
   height: 40%;
-  background: linear-gradient(180deg, transparent, rgba(200,242,78,0.12) 45%, rgba(200,242,78,0.6) 50%, rgba(200,242,78,0.12) 55%, transparent);
+  background: linear-gradient(180deg, transparent, rgba(218,119,86,0.12) 45%, rgba(218,119,86,0.6) 50%, rgba(218,119,86,0.12) 55%, transparent);
   animation: sweep 1.9s ease-in-out infinite;
 }
 @keyframes sweep {
@@ -367,9 +368,24 @@ main#app {
   overflow: hidden;
   margin-bottom: 20px;
   background: var(--card);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
-.result-overlay-wrap--small { max-height: 200px; }
-.result-overlay-wrap img { width: 100%; display: block; }
+/* object-fit: contain (not cover/crop) is essential here: the rectified
+   debug image can be a tall portrait canvas (real phone photos rectify to
+   2000-3000px+ tall). A fixed max-height with overflow:hidden and a plain
+   width:100% img - the earlier version - showed only the TOP slice of that
+   tall image, which could crop the ring itself out of view entirely while
+   still "looking like" a preview. contain guarantees the whole image is
+   always visible, letterboxed if needed, never silently cropped. */
+.result-overlay-wrap img {
+  width: 100%;
+  max-height: 60vh;
+  object-fit: contain;
+  display: block;
+}
+.result-overlay-wrap--small img { max-height: 320px; }
 
 .reading {
   display: flex;
