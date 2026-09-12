@@ -2,23 +2,25 @@
 Single consolidated regression suite for the ring measurement pipeline.
 
 Run this before every deploy - if it isn't all green, do not deploy.
-This exists specifically because a stale-deployment mismatch (local code
-fixed and verified, but an old build still running in production) was
-mistaken for a code regression. This script is the one source of truth
-for "is the CURRENT CODE actually healthy" - it takes zero dependency on
-what's currently deployed anywhere.
+
+PORTABILITY NOTE (fixed after a real failure): an earlier version of this
+script hardcoded this sandbox's own absolute paths
+(/home/claude/ring_test/...). That meant a "9/10 pass" run reported from
+inside this sandbox could not be reproduced by anyone else running the
+exact same script against the exact same shipped repo - it would fail
+with MISSING_FILE on every case outside this one machine. Paths below are
+now resolved relative to this script's own location, pointing at the
+test_set/ folder shipped alongside backend/ in the same delivery - so
+`cd backend && python3 regression_suite.py` works from a fresh clone of
+the repo, not just from the original sandbox that produced it.
 
 For each case: expected status, actual status, diameter (if any), ground
 truth (if known), absolute error (if scoreable), and reject reason (if
 rejected) are all printed in one table. A case fails the run if its
 actual status doesn't match its expected status - a photo that used to
-work and now doesn't is a hard failure, not a "huh, interesting".
+work and now doesn't is a hard failure.
 
-Paths are relative to this file's own directory (repo_root/test_set/...),
-so this runs the same way regardless of who checks the repo out or where -
-no hardcoded personal paths.
-
-Usage: python3 regression_suite.py
+Usage: python3 regression_suite.py   (run from inside backend/)
 Exit code 0 = all pass, 1 = at least one failure.
 """
 import os
@@ -27,38 +29,41 @@ import time
 import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pipeline
 from pipeline import measure_ring
 
-BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-TEST_SET_DIR = os.path.join(os.path.dirname(BACKEND_DIR), "test_set")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+TEST_SET_DIR = os.path.normpath(os.path.join(_HERE, "..", "test_set"))
 
-# (label, filename, expected_status, ground_truth_mm_or_None, max_allowed_error_mm_or_None)
-# Ground truth / expected outcomes match test_set/expected_vs_actual.csv.
+# (label, filename in test_set/, expected_status, ground_truth_mm_or_None, max_allowed_error_mm_or_None)
 CASES = [
-    ("real_ring_A",            "real_ring_A_IMG_9783.jpg",              "ACCEPT", None,  None),
-    ("real_ring_B",            "real_ring_B_IMG_9784.jpg",              "ACCEPT", 27.0,  1.0),
-    ("synth_clean_baseline",   "synth_clean_baseline.png",              "ACCEPT", 17.40, 0.3),
-    ("synth_specular",         "synth_specular_highlight.png",          "ACCEPT", 17.40, 0.3),
-    ("synth_shadow_gradient",  "synth_shadow_gradient.png",             "ACCEPT", 17.40, 0.3),
-    ("synth_low_contrast",     "synth_low_contrast_expect_retake.png",  "REJECT", None,  None),
-    ("synth_textured_bg",      "synth_textured_background.png",         "ACCEPT", 17.40, 0.3),
-    ("synth_heavy_blur",       "synth_heavy_blur_expect_retake.png",    "REJECT", None,  None),
-    ("synth_decoy_adversarial","synth_decoy_object_adversarial.png",    "ACCEPT", 17.40, 0.3),
+    ("real_ring_A_9783",        "real_ring_A_IMG_9783.jpg",             "ACCEPT", None,  None),
+    ("real_ring_B_9784",        "real_ring_B_IMG_9784.jpg",             "ACCEPT", 27.0,  1.0),
+    ("synth_clean_baseline",    "synth_clean_baseline.png",             "ACCEPT", 17.40, 0.3),
+    ("synth_specular",          "synth_specular_highlight.png",         "ACCEPT", 17.40, 0.3),
+    ("synth_shadow_gradient",   "synth_shadow_gradient.png",            "ACCEPT", 17.40, 0.3),
+    ("synth_low_contrast",      "synth_low_contrast_expect_retake.png", "REJECT", None,  None),
+    ("synth_textured_bg",       "synth_textured_background.png",        "ACCEPT", 17.40, 0.3),
+    ("synth_heavy_blur",        "synth_heavy_blur_expect_retake.png",   "REJECT", None,  None),
+    ("synth_wide_scene",        "synth_wide_scene.png",                 "ACCEPT", 17.40, 1.0),
+    ("synth_decoy_adversarial", "synth_decoy_object_adversarial.png",   "ACCEPT", 17.40, 0.3),
 ]
-# NOTE: real_ring_A has no precise ground truth (ruler-measured, ~17mm coarse -
-# see test_set/expected_vs_actual.csv) so it's checked for ACCEPT status only,
-# not against a numeric tolerance.
 
 
 def run():
     rows = []
     all_pass = True
 
+    if not os.path.isdir(TEST_SET_DIR):
+        print(f"FATAL: test_set directory not found at {TEST_SET_DIR}")
+        print("This script expects to run from inside backend/, with a sibling test_set/ folder.")
+        return 1
+
     for label, filename, expected_status, gt, max_err in CASES:
         path = os.path.join(TEST_SET_DIR, filename)
         photo = cv2.imread(path)
         if photo is None:
-            rows.append((label, expected_status, "MISSING_FILE", "-", "-", "-", "-", "-", "FAIL"))
+            rows.append((label, expected_status, "MISSING_FILE", "-", "-", "-", path, "-", "FAIL"))
             all_pass = False
             continue
 
@@ -87,7 +92,7 @@ def run():
         rows.append((label, expected_status, actual_status, diam_str, gt_str, err_str, reason_str, f"{elapsed_ms:.0f}ms", verdict))
 
     headers = ["case", "expected", "actual", "diam_mm", "gt_mm", "abs_err", "reject_reason", "time", "verdict"]
-    widths = [26, 9, 9, 8, 7, 8, 18, 8, 7]
+    widths = [26, 9, 9, 8, 7, 8, 20, 8, 7]
     print(" ".join(h.ljust(w) for h, w in zip(headers, widths)))
     print("-" * sum(widths))
     for row in rows:
