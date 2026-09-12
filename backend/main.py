@@ -139,6 +139,17 @@ async def measure(file: UploadFile = File(...)):
             "message": "Could not read this photo. Please try a different image (JPEG or PNG).",
         })
 
+    # DIAGNOSTIC LOGGING (temporary): print what actually arrives at the
+    # server. Added because a downscaled copy of an already-validated,
+    # passing photo (real_ring_B) was proven locally to reproduce the exact
+    # same RING_EDGE_UNSTABLE failure users are seeing on new phone photos -
+    # but there's no visibility into what resolution phones are actually
+    # uploading in production. This line has zero effect on measurement
+    # behavior; it only writes to Railway's logs so we can check actual
+    # upload sizes against real failure reports instead of guessing.
+    ph, pw = photo.shape[:2]
+    print(f"[measure] received photo: {pw}x{ph}px, {len(raw)/1024:.0f}KB, filename={file.filename!r}")
+
     result = pipeline.measure_ring(photo)
     elapsed_ms = round((time.time() - t0) * 1000, 1)
 
