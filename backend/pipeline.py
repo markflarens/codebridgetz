@@ -143,14 +143,30 @@ def detect_and_rectify(photo):
     return rectified, marker_rect_out, None
 
 def check_exposure(gray, dark_thresh=25, bright_thresh=250,
-                    max_dark_fraction=0.5, max_bright_fraction=0.15,
+                    max_dark_fraction=0.5, max_bright_fraction=0.35,
                     min_mean=60, max_mean=235):
     """Reject photos that are too dark or too washed-out to trust before
     spending any time on marker/ring detection. Thresholds calibrated with
     real working photos as the floor/ceiling to stay clear of: both real
     test photos (evenly lit, indoor) measured mean brightness ~137,
     frac_dark(<25) ~1%, frac_bright(>250) ~0.01-0.04% - comfortably inside
-    these bounds. Returns a reason string or None.
+    these bounds.
+
+    max_bright_fraction was originally set to 0.15, calibrated only against
+    those two real photos. That was too tight: it produced a false
+    OVEREXPOSED reject on test_set/synth_shadow_gradient.png - a documented
+    regression-test photo (directional lighting gradient) that measures
+    frac_bright ~19% while still being a perfectly readable, correctly-
+    ACCEPTable photo (marker and ring both detect fine; mean brightness is
+    unremarkable at ~212, same as the other clean synthetic renders). A
+    bright directional gradient can legitimately blow out a fifth of the
+    frame (background, out-of-focus areas) without the marker/ring region
+    itself being compromised - fraction-of-frame alone doesn't distinguish
+    "unreadable" from "unevenly lit but fine". Raised to 0.35 (comfortably
+    above the observed 19%) so this gate only catches photos where the
+    large majority of the frame is blown out, and re-verified against the
+    full test_set with no other regressions (see delivery notes / CSV).
+    Returns a reason string or None.
     """
     mean_b = gray.mean()
     frac_dark = (gray < dark_thresh).mean()
