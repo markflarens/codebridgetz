@@ -4,3 +4,19 @@ python-multipart==0.0.32
 opencv-contrib-python==4.13.0.92
 numpy==2.4.6
 pillow==12.3.0
+
+# --- Ring-body segmentation (MobileSAM via ultralytics) ------------------
+# ultralytics==8.4.150 pinned exactly: verified as a real, published PyPI
+# release via web search (not trusted from this sandbox's own `pip show`,
+# which has previously been proven to report phantom not-yet-real
+# versions for fast-moving packages - see DELIVERY_NOTES for that
+# incident). torch is pinned to a RANGE rather than an exact patch version
+# for the same reason in the other direction: this sandbox has 2.14.0
+# installed, but only PyTorch 2.12 could be independently confirmed real
+# via web search, and a brittle exact pin that turns out not to exist yet
+# on the CPU wheel index (see Dockerfile - we install the CPU-only build,
+# not the default CUDA one) fails the whole deploy outright. A range lets
+# pip/Railway resolve to whatever real CPU build is actually published in
+# this line at build time instead of gambling on one exact guessed number.
+torch>=2.12,<2.15
+ultralytics==8.4.150

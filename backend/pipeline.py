@@ -1,5 +1,8 @@
 """
-Ring measurement pipeline (deterministic computer vision, no ML/LLM).
+Ring measurement pipeline (deterministic CV for geometry/calibration;
+MobileSAM, a small promptable segmentation model, for ring-BODY
+segmentation only - see "ML DEPENDENCY, HONESTLY" below for exactly what
+that model is and is not used for).
 
 GENERALIZATION / NO-OVERFITTING POLICY (read before touching this file):
 Every decision in this file - which z-threshold to trust, which Hough
@@ -32,9 +35,9 @@ specific test photo it is or what its known diameter is. Concretely:
   ambiguous to trust, should return a specific retake reason - never an
   unreliable number dressed up as a confident one.
 
-DETECTION ARCHITECTURE (SEGMENTATION-FIRST REVISION - current): earlier
-revisions of this file went through three designs, each one's failures
-motivating the next:
+DETECTION ARCHITECTURE (RING-BODY / MASK-TOPOLOGY REVISION - current):
+earlier revisions of this file went through FOUR designs, each one's
+failures motivating the next:
 
   1. "Strongest circle" scoring - picked whichever candidate looked
      cleanest/most circular and had the most cross-method agreement.
@@ -63,124 +66,135 @@ motivating the next:
      curves IS the hole, and scoring curves against each other never
      answers that question directly.
 
-This revision (4) stops choosing between ellipse candidates altogether.
-Instead it SEGMENTS: classify every pixel in a localized window as
-"background-colored" or not (reusing the same Lab-space chroma+brightness
-distance from sample_background_reference/the old material-contrast
-gate, now the SOLE primary detection mechanism rather than a gate or a
-weak cue), find the background-colored CONNECTED COMPONENT that is fully
-enclosed (does not touch the window border) - this is the hole, by
-construction, because only the hole is background visible *through* the
-ring rather than background *around* it - and fit an ellipse to that
-component's boundary. There is no scoring of multiple candidate curves
-against each other: there is exactly one enclosed background region per
-threshold, and the question becomes "does this single region's boundary,
-and its shape, stay consistent as the classification threshold is
-loosened" rather than "which of several curves looks most plausible".
+  4. "Segmentation-first via background-color matching" - classified
+     every pixel as "background-colored or not" (Lab chroma+brightness
+     distance from a sampled table/background reference) and took the
+     largest enclosed (non-border-touching) background-colored connected
+     component as the hole, accepting/rejecting based on how that
+     region's ellipse behaved across a sweep of classification
+     thresholds. This removed the "which candidate CURVE is the hole"
+     ambiguity of revision 3, but introduced a different, more basic
+     problem, raised directly by this project's own reviewer: the hole
+     was still being defined ENTIRELY by matching the *surrounding
+     background's color*, not by anything about the ring itself. That is
+     fragile exactly where real photos are hardest - ordinary shadows,
+     reflections, textured surfaces, and illumination gradients all
+     change how "background-colored" a given pixel looks without the
+     pixel having moved from background to ring or back. It also has a
+     conceptual gap: an enclosed background-colored region is not
+     *guaranteed* to be the physical hole (a shadow pooled inside the
+     ring, or a patch of background-colored material sitting on top of
+     the ring, would pass the same test), and fitting an ellipse to that
+     region's CONVEX HULL means an incomplete or wrong segmented crescent
+     can still produce a convincing-looking ellipse - cleanliness of the
+     resulting shape does not certify that the shape was found for the
+     right reason.
 
-TWO ALTERNATIVES WERE INVESTIGATED AND REJECTED before this approach, per
-the explicit instruction to look at SAM-family models and at a simpler
-deterministic method and compare before deciding:
+This revision (5) changes what is being segmented. Instead of asking "is
+this pixel colored like the background" (revision 4) it asks "is this
+pixel part of the physical ring body", using a small PROMPTABLE
+segmentation model (MobileSAM) seeded with POSITIVE prompts on the
+ring's own band material and NEGATIVE prompts inside the hole and outside
+the ring - i.e. it is told what the ring band itself looks like, not what
+the table looks like. The enclosed hole is then read off the resulting
+mask's own CONTOUR TOPOLOGY (RETR_CCOMP hierarchy: the largest top-level
+contour is the ring body, its largest enclosed child contour is the
+hole) rather than from any color-matching step. A convex-hull SOLIDITY
+check on the hole contour is used only DEFENSIVELY, as a validity gate
+("does this region look like a genuine, mostly-convex opening, or like an
+incomplete/bitten crescent") - the ellipse itself is always fit to the
+mask's own RAW hole contour, never to the hull, so a hull-reconstructed
+shape can no longer be mistaken for a measurement.
 
-  - GrabCut (cv2.grabCut, GC_INIT_WITH_MASK) seeded from the coarse Hough
-    ROI (ring band marked probable-foreground, a thin outer margin marked
-    probable-background): on all 3 real test photos it merged the ring
-    band and the hole interior into one foreground blob. Root cause: a
-    naive radius-based seeding gives GrabCut no "probable background"
-    seed pixels ANYWHERE inside the outer disk, so it has no signal that
-    the centre region should be background rather than "more ring". It
-    would need a seed that already roughly marks the hole, which assumes
-    the very thing being detected - not viable without a separate hole
-    localizer already in hand.
-  - FastSAM (ultralytics FastSAM-s.pt, promptless "segment everything"):
-    inconsistent across the 3 real photos. On the one real photo with
-    strong hole/band contrast it isolated the hole cleanly as its own
-    mask; on the other two it merged the entire ring/cap body and its
-    hole into a single object mask (no separate "hole" segment at all),
-    i.e. it reproduced a version of the same ambiguity this redesign is
-    trying to remove, rather than resolving it. A lightweight promptless
-    segmenter does not reliably know "the hole is a separate object from
-    the ring" any better than the edge-based ensemble did. Not used.
+ArUco/rectification and coarse ROI localization (locate_outer_ring_circle)
+are UNCHANGED from every earlier revision - purely geometric, not a
+detection decision. What changed is everything after that coarse ROI.
 
-The deterministic multi-threshold approach below was found to perform
-comparably-or-better than FastSAM on all 3 real photos, is reproducible
-(no model weights, no GPU), is fast, and directly implements the
-requested pipeline stages (segment ring material -> find the enclosed
-hole -> fit an ellipse to the hole boundary -> convert to mm via the
-ArUco scale) rather than approximating them through ellipse-candidate
-scoring.
+TWO-HYPOTHESIS STRATEGY (the key structural fix this revision adds):
+locate_outer_ring_circle's own docstring documents a real ambiguity - on a
+clean, high-contrast photo, Hough can lock onto the ring's INNER hole
+edge just as easily as its outer edge, and there is no way to tell which
+one it found before looking further. Rather than guessing, this revision
+generates BOTH possible readings of that hint and tries each one all the
+way through segmentation and topology analysis:
+  - H1 ("r=outer"): assume the hint IS the outer edge; search INWARD
+    (reusing the existing radial_inner_candidate) for a hole-edge radius.
+  - H2 ("r=inner"): assume the hint IS the hole edge; search OUTWARD
+    (the new radial_outer_candidate, a mirror of radial_inner_candidate)
+    for an outer band-edge radius.
+Each hypothesis that produces a plausible (inner_r, outer_r) pair gets
+its own MobileSAM segmentation + topology analysis; whichever hypothesis
+(if any) produces a VALID topology (single body, single hole, hole
+solidity above threshold, plausible axis ratio) is reported. When BOTH
+hypotheses are valid, their diameters are compared as an extra confidence
+signal (reported, not gating) rather than a reason to prefer one over the
+other beyond its own higher solidity.
 
-PIPELINE STAGES (measure_ring):
-  1. ArUco marker detection + perspective rectification to a fixed
-     px/mm scale (detect_and_rectify) - UNCHANGED from every earlier
-     revision; this is purely geometric calibration, not a detection
-     decision.
-  2. Coarse ring ROI localization (locate_outer_ring_circle, Hough) -
-     UNCHANGED in mechanism, still coarse-only: it tells the rest of the
-     pipeline roughly where the ring is so the segmentation window and
-     the background-reference annulus can be sized/centered correctly. It
-     is NEVER used to decide which boundary is the true inner hole.
-  3. Background-color reference (sample_background_reference) - sampled
-     LOCALLY around the localized ring first, falling back to a whole-
-     frame sample. This is now HARD-REQUIRED (reinstated from its
-     demotion in revision 3): without knowing what "background-colored"
-     means for this specific photo, there is no segmentation signal to
-     build a mask from at all, so a missing reference is an honest
-     BACKGROUND_REFERENCE_UNAVAILABLE retake, not a silent fallback to
-     some other mechanism.
-  4. segment_hole_candidates: sweep a range of Lab-distance
-     background-classification thresholds (z, in units of the
-     background's own per-channel robust noise scale). At each z, build
-     a dense per-pixel background-likeness mask, clean it with a
-     morphological open (drop thin false-positive speckle) then close
-     (seal small real gaps from local noise/texture), find the enclosed
-     (non-border-touching) connected component with the largest area,
-     take its CONVEX HULL (the true hole boundary is convex; a local
-     brightness gradient or reflection can bite a non-convex notch out of
-     the raw thresholded region without the hole actually having that
-     shape - the hull recovers it), and fit an ellipse to the hull.
-  5. Acceptance is decided from how that single region's ellipse BEHAVES
-     across the z-sweep, not from comparing it to any other candidate:
-     - require at least 2 valid z-thresholds to have produced a region
-       at all (otherwise HOLE_NOT_FOUND - there's no enclosed background
-       region to measure);
-     - STABILITY: as z is loosened, a real hole's mask should stop
-       growing once the open threshold change has caught the photo's own
-       noise floor of real boundary pixels - the diameter at the two
-       loosest valid z's should agree within STABILITY_TOL_MM. If the
-       region keeps growing even at the loosest thresholds tried, the
-       mask is still eating into ambiguous surrounding material and there
-       is no trustworthy boundary to report (MASK_AMBIGUOUS);
-     - SHAPE: once stable, the loosest stable candidate's axis ratio
-       (minor/major) must be at least MIN_AXIS_RATIO_FOR_ACCEPT. A region
-       that stabilizes but stays far from circular/elliptical is not
-       cleanly recovering the hole's outline (HOLE_NOT_SUFFICIENTLY_-
-       VISIBLE) - this was found concretely on one real test photo (a
-       knurled, serrated cap, not a plain ring band) whose opening has a
-       genuine brightness gradient across it that no single threshold
-       recovers cleanly: axis ratio never exceeds ~0.6 even after
-       widening the z-range and adding the hull correction, and the
-       region never stops leaking past the object's textured edge at
-       looser z - a legitimate "mask ambiguous/hole not sufficiently
-       visible" case to honestly reject, not one to keep tuning thresholds
-       to force through.
-  6. The ACCEPTED measurement is the loosest STABLE candidate's ellipse
-     (not the tightest, and not an average) - the loosest threshold that
-     hasn't started eating into non-hole material is the one most likely
-     to have recovered the hole's full true extent rather than an
-     undersized, overly-conservative core of it.
+ALTERNATIVES INVESTIGATED AND REJECTED before settling on prompted
+MobileSAM, per the explicit instruction to compare a properly-seeded
+deterministic baseline against a genuinely promptable model, and to
+judge by mask correctness first, diameter only afterward:
 
-STABILITY_TOL_MM and MIN_AXIS_RATIO_FOR_ACCEPT, and the z_thresholds grid
-itself, were reasoned from the observed SHAPE of each test photo's own
-z-vs-diameter and z-vs-axis_ratio curves (where does growth actually stop;
-how separated are the clean-accept cases from the one genuinely ambiguous
-real photo), never from forcing any specific known diameter to pass - see
-the no-overfitting policy above. The z-grid was widened after an initial
-coarse grid (1.0, 1.5, ..., 3.0) produced a misleading "still growing"
-read on a known-good synthetic case simply because it skipped over the
-point where that photo's own curve actually flattens (1.25-1.5); the
-finer grid below resolved that for every case tested without narrowing
-any single case's own true signal.
+  - Seeded GrabCut (cv2.grabCut, GC_INIT_WITH_MASK) using the SAME
+    two-hypothesis geometric priors (a small central disk as definite
+    background, a thin annulus near the hypothesis's own band as
+    definite foreground, well outside as definite background, the large
+    genuinely-ambiguous middle region left probable-background rather
+    than guessed): once properly seeded (an earlier, naive fixed-fraction
+    seeding mis-seeded entirely - see git history / DELIVERY_NOTES for
+    that failure), this produced topologically clean results (single
+    body, single hole, solidity up to ~0.98) on 2 of 3 real photos, and
+    visually GOOD masks on those two. On the third (a ring with a strong
+    internal reflection gradient across its opening) it produced a mask
+    that was STILL topologically clean by every structural check, yet
+    visibly WRONG once inspected directly: GrabCut's color-GMM
+    classified the bright, reflective part of the true hole as ring
+    material (it resembles the band's own highlights) while correctly
+    keeping the darker part as hole - cutting a real opening roughly in
+    half. This is exactly the "inspect the mask before trusting its
+    topology" failure mode the no-overfitting policy above warns about,
+    now demonstrated concretely: topological cleanliness is NECESSARY but
+    not SUFFICIENT.
+  - Prompted FastSAM (ultralytics FastSAM-s.pt, using the SAME prompt
+    points as MobileSAM below): returned no mask for every hypothesis on
+    every photo. Investigated directly (not assumed) by calling FastSAM
+    without any prompts and inspecting its raw output: it only ever
+    generates a handful of "segment everything" object masks per image,
+    and its `.prompt()` API SELECTS among those few pre-generated masks
+    using the given points - it does not generate a new mask conditioned
+    on the prompts the way a true promptable segmenter does. Since this
+    project's earlier, separate investigation of promptless FastSAM had
+    already found it fails to isolate the hole as its own object on 2 of
+    3 real photos, prompted FastSAM inherits that same ceiling regardless
+    of how good the prompts are. Not usable for this task.
+  - MobileSAM (ultralytics.SAM wrapper around mobile_sam.pt, a real
+    point-promptable encoder/decoder model, unlike FastSAM's filter-only
+    `.prompt()`): produced visually complete, correctly-shaped hole
+    boundaries on ALL 3 real test photos, INCLUDING the reflective-ring
+    case where properly-seeded GrabCut's mask was confidently wrong, and
+    including the one photo where GrabCut found no valid topology at
+    all. This is what backs measure_ring below.
+
+ML DEPENDENCY, HONESTLY: this revision adds a real dependency this
+project did not have before (torch + ultralytics + a ~39MB MobileSAM
+checkpoint) and a real per-photo cost (loading + CPU inference for up to
+two hypotheses). The model's role is scoped narrowly and deliberately:
+it is used ONLY to answer "which pixels are ring-body material, given
+these geometric prompts" - it never estimates a diameter, is never asked
+"how big is this ring", and diameter is still computed the same way every
+revision has computed it: classical ellipse-fitting on a mask's own
+contour, converted to mm via the ArUco-calibrated px/mm scale. See
+README.md / DELIVERY_NOTES.md for the full size/latency tradeoff this
+introduces and why it was judged worth it.
+
+ACCEPTANCE is decided from MASK TOPOLOGY, not from diameter, per the
+explicit instruction to inspect mask correctness before ever looking at a
+number: a hypothesis's segmentation is only even considered a candidate
+measurement once analyze_mask_topology confirms exactly one ring body,
+exactly one enclosed hole, that hole's solidity above MIN_HOLE_SOLIDITY,
+and its fitted-ellipse axis ratio above MIN_HOLE_AXIS_RATIO. Only after a
+hypothesis passes that gate does its ellipse's diameter become the
+reported measurement (or a cross-hypothesis comparison value).
 """
 import os
 import cv2
@@ -207,42 +221,93 @@ MARKER_OUT_ORIGIN = (60, 60)
 # photography/cutting slop (someone may leave extra margin when cutting).
 MARKER_MASK_PAD_PX = 150
 
+# --- MobileSAM: loaded lazily, once, on first use -----------------------
+# A small (~39MB) promptable segmentation model (TinyViT encoder + SAM
+# mask decoder), used ONLY to turn geometric prompts (see
+# build_ring_prompts) into a ring-body mask - see the module docstring's
+# "ML DEPENDENCY, HONESTLY" section for the scope of what this model is
+# and is not used for. Loaded once at first use (not at import time) so
+# importing this module for unrelated reasons (e.g. regression_suite's
+# no-ground-truth-leakage static check) never pays the load cost, and so
+# a deployment without network access to fetch the checkpoint still
+# imports cleanly and fails per-request with a clear reason rather than
+# crashing at startup.
+_SAM_MODEL = None
+_SAM_LOAD_ERROR = None
+
+
+def _get_sam_model():
+    global _SAM_MODEL, _SAM_LOAD_ERROR
+    if _SAM_MODEL is not None or _SAM_LOAD_ERROR is not None:
+        return _SAM_MODEL
+    try:
+        from ultralytics import SAM
+        weights_path = os.environ.get(
+            "MOBILE_SAM_WEIGHTS",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights", "mobile_sam.pt"),
+        )
+        _SAM_MODEL = SAM(weights_path)
+    except Exception as e:  # pragma: no cover - exercised only when weights/deps are missing
+        _SAM_LOAD_ERROR = str(e)
+        _SAM_MODEL = None
+    return _SAM_MODEL
+
+
+# Mask-topology validity thresholds (see analyze_mask_topology). Reasoned
+# the same way every other threshold in this file is reasoned - from the
+# observed separation between clean-accept and genuinely-ambiguous real
+# photos, never from forcing a specific known diameter to pass:
+#   - MIN_HOLE_SOLIDITY: a genuine round opening's raw contour is nearly
+#     convex; a mask that caught only part of the opening (GrabCut's
+#     reflection failure, or a MobileSAM mask that bit into the band)
+#     produces a visibly non-convex hole contour with solidity well below
+#     this on every case tried, while every visually-correct mask scored
+#     >=0.9.
+#   - MIN_HOLE_AXIS_RATIO: once a hole is convex-ish, it should also be
+#     roughly round/elliptical (a near-overhead photo never produces a
+#     highly eccentric TRUE opening - detect_and_rectify's side_ratio gate
+#     already screens out steep angles upstream). A stable-looking but
+#     badly elongated hole is evidence of a segmentation/topology problem,
+#     not an unusually-shaped ring.
+MIN_HOLE_SOLIDITY = 0.85
+MIN_HOLE_AXIS_RATIO = 0.7
+
 
 class MeasurementResult:
     def __init__(self):
         self.ok = False
         self.reason = None          # structured failure code
         self.diameter_mm = None
-        # NOTE: deliberately NOT called "uncertainty_mm". Under the
-        # segmentation-first architecture this is the gap between the
-        # loosest STABLE z-threshold's diameter and the next-loosest one
-        # considered (see segment_hole_candidates / measure_ring) - a
-        # stability signal on THIS photo's own mask, not a physical
-        # measurement uncertainty. It says nothing about print scale
-        # error, lens distortion, or ArUco corner localization error.
+        # NOTE: deliberately NOT called "uncertainty_mm". Under this
+        # two-hypothesis, mask-topology architecture this is
+        # |diam(H1) - diam(H2)| when BOTH hypotheses independently produced
+        # a VALID topology - a cross-hypothesis agreement signal on THIS
+        # photo, not a physical measurement uncertainty. When only one
+        # hypothesis was valid, there is nothing to compare against and
+        # this stays None. It says nothing about print scale error, lens
+        # distortion, or ArUco corner localization error.
         self.detection_spread_mm = None
-        self.candidates_mm = []     # [(z, diameter_mm, candidate_dict), ...] every z tried
-        # Keyed by a label per z-threshold (e.g. "z=1.50") rather than by
-        # detection "family" - there is only one detection mechanism now.
-        # Kept under this field name for API/frontend compatibility (the
-        # frontend renders this generically as "label: value mm").
+        self.candidates_mm = []     # [(label, diameter_mm, topo_dict), ...] every hypothesis with a VALID topology
+        # Keyed by hypothesis label ("r=outer" / "r=inner") rather than by
+        # detection "family" or z-threshold. Kept under this field name for
+        # API/frontend compatibility (the frontend renders this generically
+        # as "label: value mm").
         self.family_estimates = {}
         self.debug_img = None
-        # Every candidate ellipse considered (every z tried), whether or
-        # not it ended up being the accepted one, together with a reason
-        # when a z produced no usable region at all. Kept on the result so
-        # a debug overlay can show the full sweep, not just the winner.
+        # Every hypothesis tried, whether or not it ended up valid, with a
+        # reason when it was degenerate, produced no mask, or failed the
+        # topology gate. Kept on the result so a debug overlay/log can show
+        # the full attempt, not just the winner.
         self.rejected_candidates = []
-        # SEGMENTATION-FIRST REVISION: reporting fields describing the
-        # winning candidate's own behavior across the z-sweep, replacing
-        # revision 3's ellipse-ensemble fields (boundary_coverage,
-        # fit_residual, color_confidence), which no longer have meaning
-        # once there is only one candidate region per threshold instead of
-        # several competing ellipse candidates to score against each
-        # other.
+        # Reporting fields describing the WINNING hypothesis, replacing the
+        # z-sweep-stability fields (z_threshold_used, n_stable_z) from the
+        # background-color-matching revision, which no longer have meaning
+        # once there is no z-sweep at all.
+        self.hypothesis_used = None     # "r=outer" or "r=inner" - which hypothesis won
+        self.mask_solidity = None       # hole contour area / its convex hull area
         self.hole_axis_ratio = None     # minor/major of the accepted ellipse, shape-quality signal
-        self.z_threshold_used = None    # which z-threshold produced the accepted candidate
-        self.n_stable_z = None          # how many of the loosest z's agreed within STABILITY_TOL_MM
+        self.n_bodies = None            # number of significant top-level mask components found
+        self.n_holes = None             # number of significant enclosed components found in the winning body
 
 
 def find_marker_corners(gray):
@@ -519,18 +584,21 @@ def radial_inner_candidate(gray_for_gradient, edge_map, center, outer_radius_px,
                            gradient_angle_tolerance_deg=20):
     """
     Single-best-peak version of the radial fallback: return only the
-    tallest peak in the radius histogram. Used SOLELY by
-    locate_outer_ring_circle() to validate a Hough circle (a yes/no "does
-    this look ring-like at all" check, for coarse ROI localization only) -
-    that caller only ever needs one answer, and changing its behavior has
-    previously been shown to change which Hough circle gets picked as the
-    outer boundary (a real regression - see git history around commits
-    3e07ad8 / 0767fc5), so it is kept exactly as originally calibrated.
-
-    measure_ring() itself does not use this, or any other edge/radial/
-    contour-based candidate, for its own measurement - see the module
-    docstring's SEGMENTATION-FIRST REVISION section for why boundary
-    selection moved entirely to segment_hole_candidates.
+    tallest peak in the radius histogram. Two independent callers rely on
+    it, deliberately kept exactly as originally calibrated because
+    changing its behavior has previously been shown to change which Hough
+    circle gets picked as the outer boundary (a real regression - see git
+    history around commits 3e07ad8 / 0767fc5):
+      - locate_outer_ring_circle() uses it to validate a Hough circle (a
+        yes/no "does this look ring-like at all" check, for coarse ROI
+        localization only).
+      - build_band_hypotheses() reuses it as hypothesis H1's own radius
+        search ("outer_ring_hint IS the outer edge; where's the hole") -
+        see the module docstring's TWO-HYPOTHESIS STRATEGY. Even here it
+        only ever produces a PROMPT radius for MobileSAM, never the
+        measurement itself - which boundary is actually the hole is
+        decided by analyze_mask_topology on the resulting mask, not by
+        this function's own edge histogram.
     """
     hist, r_min, r_max = _radial_edge_histogram(
         gray_for_gradient, edge_map, center, outer_radius_px,
@@ -564,85 +632,202 @@ def radial_inner_candidate(gray_for_gradient, edge_map, center, outer_radius_px,
     }
 
 
-def sample_background_reference(rectified_bgr, marker_rect, outer_ring_hint,
-                                  local_inner_scale=1.15, local_outer_scale=3.0,
-                                  min_local_px=1500):
+def radial_outer_candidate(gray_for_gradient, edge_map, center, inner_radius_px,
+                            min_ratio=1.05, max_ratio=1.6,
+                            min_support=0.02, min_prominence=1.2,
+                            gradient_angle_tolerance_deg=20):
     """
-    Sample the photo's own TABLE/BACKGROUND color, independent of what any
-    ring/hole detector thinks. Under the segmentation-first architecture
-    this is no longer a secondary cue or a gate on ellipse candidates - it
-    is the PRIMARY input that segment_hole_candidates classifies every
-    pixel against: "background-colored" vs. not. Every stage after this
-    one depends on it; a photo with no usable reference is measured as
-    BACKGROUND_REFERENCE_UNAVAILABLE rather than attempted on no signal.
+    Mirror of radial_inner_candidate, searching OUTWARD from a known
+    radius instead of inward. Used as hypothesis H2's radius search (see
+    module docstring's TWO-HYPOTHESIS STRATEGY): if outer_ring_hint
+    actually landed on the ring's INNER hole edge rather than its outer
+    edge (a documented risk of locate_outer_ring_circle on a clean,
+    high-contrast photo), this looks for a plausible OUTER band-edge
+    radius just beyond it, the same way radial_inner_candidate looks
+    inward for a hole edge under the opposite assumption.
 
-    LOCAL-FIRST SAMPLING: wood grain and lighting are not uniform across a
-    whole photo - a corner of the frame far from the ring can legitimately
-    be a different color/brightness than the table immediately around the
-    ring (a lamp to one side, a shadow falling across part of the table).
-    What segmentation actually needs is what "background" looks like
-    *right around the ring*, not a whole-frame average that can be pulled
-    off by regions nowhere near it. So when outer_ring_hint localizes the
-    ring, this samples an annulus around it first - from
-    local_inner_scale*radius (safely clear of the ring's own outer edge
-    and band) out to local_outer_scale*radius - and only falls back to the
-    old whole-frame (marker-excluded) sample if that local annulus doesn't
-    yield enough pixels (ring too close to the frame edge, hint overlaps
-    the marker exclusion heavily, etc).
-
-    MEDIAN (not mean) is used throughout so that even a sample still
-    contaminated by a sliver of ring/marker pixels stays a robust estimate
-    as long as background pixels are the majority - true for both the local
-    annulus and the whole-frame fallback on any photo actually following
-    the "near-overhead, ring and marker both clearly visible" capture
-    instructions.
-
-    Returns None (never a fabricated/degenerate reference) if too little of
-    the frame is left after exclusions to trust either sample at all - the
-    caller must treat that as "cannot segment at all" and retake.
+    Reuses the same radial-gradient-filtered edge histogram as
+    radial_inner_candidate (see _radial_edge_histogram's docstring for why
+    filtering to radially-oriented edge pixels is necessary on textured
+    backgrounds) - only the direction and the band-ratio parameterization
+    differ, since here the known radius is the INNER bound of the search
+    band rather than the outer one.
     """
-    h, w = rectified_bgr.shape[:2]
-    lab = cv2.cvtColor(rectified_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-
-    mx0, my0, mx1, my1 = marker_rect
-    pad = MARKER_MASK_PAD_PX
-    mex0, mey0 = max(0, int(mx0 - pad)), max(0, int(my0 - pad))
-    mex1, mey1 = min(w, int(mx1 + pad)), min(h, int(my1 + pad))
-
-    def _median_mad(bg_pixels, n_px, source):
-        lab_median = np.median(bg_pixels, axis=0)
-        # Median Absolute Deviation, scaled to be std-equivalent for a
-        # normal distribution (x1.4826) - a robust noise-floor estimate
-        # that isn't blown up by the occasional outlier pixel (shadow edge,
-        # dust, a sliver of ring that leaked past exclusion).
-        lab_mad = np.median(np.abs(bg_pixels - lab_median), axis=0) * 1.4826
-        return {"lab_median": lab_median, "lab_mad": lab_mad, "n_px": n_px, "source": source}
-
-    if outer_ring_hint is not None:
-        ocx, ocy, orad = outer_ring_hint
-        yy, xx = np.ogrid[:h, :w]
-        dist2 = (xx - ocx) ** 2 + (yy - ocy) ** 2
-        local_mask = (dist2 >= (orad * local_inner_scale) ** 2) & (dist2 <= (orad * local_outer_scale) ** 2)
-        local_mask[mey0:mey1, mex0:mex1] = False
-        if local_mask.sum() >= min_local_px:
-            bg_pixels = lab[local_mask]
-            return _median_mad(bg_pixels, int(local_mask.sum()), "local")
-
-    # Fallback: whole-frame, marker (and ring hint, if any) excluded - the
-    # original design, kept for photos where a local annulus isn't usable.
-    exclude = np.zeros((h, w), dtype=bool)
-    exclude[mey0:mey1, mex0:mex1] = True
-    if outer_ring_hint is not None:
-        ocx, ocy, orad = outer_ring_hint
-        yy, xx = np.ogrid[:h, :w]
-        exclude |= (xx - ocx) ** 2 + (yy - ocy) ** 2 <= (orad * 1.4) ** 2
-
-    bg_mask = ~exclude
-    if bg_mask.sum() < 500:
+    cx, cy = center
+    r_min = int(np.ceil(inner_radius_px * min_ratio))
+    r_max = int(np.floor(inner_radius_px * max_ratio))
+    if r_max <= r_min + 3:
         return None
 
-    bg_pixels = lab[bg_mask]
-    return _median_mad(bg_pixels, int(bg_mask.sum()), "global")
+    hist, r_min, r_max = _radial_edge_histogram(
+        gray_for_gradient, edge_map, center, r_max,
+        1.0, r_max / max(1, r_min), gradient_angle_tolerance_deg
+    )
+    if hist is None:
+        return None
+
+    peak_idx = int(np.argmax(hist))
+    radius = float(r_min + peak_idx)
+    peak = float(hist[peak_idx])
+
+    support = peak / max(1.0, 2.0 * np.pi * radius)
+    baseline = float(np.percentile(hist, 75))
+    prominence = peak / max(1.0, baseline)
+
+    if support < min_support or prominence < min_prominence:
+        return None
+
+    return {"radius": radius, "support": support, "prominence": prominence}
+
+
+def build_ring_prompts(cx, cy, inner_r, outer_r, win_r, n_pos=8, n_neg_outside=4):
+    """
+    Build the point prompts MobileSAM needs to segment the RING BODY
+    itself, given a hypothesized (inner_r, outer_r) band:
+      - POSITIVE prompts around the band's own midpoint radius, at several
+        angles, so the model is shown actual ring-band material.
+      - One NEGATIVE prompt at the hole center - the center of a near-
+        overhead ring photo is hole (or, rarely, fully occluded), never
+        ring band, in every physically plausible case in scope here.
+      - NEGATIVE prompts well outside the ring (near the crop window edge)
+        so the model is also shown what is clearly NOT the ring.
+    This is a PROMPT, not a classification rule: MobileSAM still has to
+    decide the actual mask boundary from the image itself, these points
+    only tell it where to look for positive/negative examples.
+    """
+    points, labels = [], []
+    band_r = (inner_r + outer_r) / 2.0
+    for i in range(n_pos):
+        theta = 2 * np.pi * i / n_pos
+        points.append([cx + band_r * np.cos(theta), cy + band_r * np.sin(theta)])
+        labels.append(1)
+    points.append([cx, cy])
+    labels.append(0)
+    for i in range(n_neg_outside):
+        theta = 2 * np.pi * i / n_neg_outside + 0.3
+        rr = win_r * 0.95
+        points.append([cx + rr * np.cos(theta), cy + rr * np.sin(theta)])
+        labels.append(0)
+    return points, labels
+
+
+def segment_ring_body_mobilesam(rectified_bgr, sam_model, cx, cy, inner_r, outer_r,
+                                 outer_margin=1.3):
+    """
+    Run MobileSAM, prompted with build_ring_prompts' points for this one
+    hypothesis's (inner_r, outer_r) band, to produce a ring-BODY mask -
+    the segmentation target this revision uses instead of matching the
+    surrounding background's color (see module docstring). Returns a
+    full-rectified-frame-sized uint8 mask (0/255), or None if the model
+    produced no mask at all for this prompt set (e.g. a genuinely
+    degenerate/empty crop).
+    """
+    h, w = rectified_bgr.shape[:2]
+    win_r = outer_r * outer_margin
+    x0 = max(0, int(cx - win_r)); x1 = min(w, int(cx + win_r))
+    y0 = max(0, int(cy - win_r)); y1 = min(h, int(cy + win_r))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    crop = rectified_bgr[y0:y1, x0:x1]
+
+    lcx, lcy = cx - x0, cy - y0
+    points, labels = build_ring_prompts(lcx, lcy, inner_r, outer_r, win_r)
+
+    try:
+        results = sam_model.predict(crop, points=[points], labels=[labels],
+                                     device="cpu", verbose=False)
+    except Exception:
+        return None
+    if not results or results[0].masks is None or results[0].masks.data.shape[0] == 0:
+        return None
+
+    m = results[0].masks.data.cpu().numpy()[0]
+    # Resize the model's own (lower-resolution) mask up to the crop's
+    # pixel size, then re-binarize at the midpoint. Without this,
+    # cv2.resize's interpolation leaves intermediate (non-0/255) values
+    # along the boundary, and cv2.findContours downstream treats ANY
+    # nonzero pixel as foreground - silently growing the mask by a
+    # fraction of the resize kernel's width in every direction, a real
+    # measurement bias with nothing to do with any specific photo.
+    m_resized = cv2.resize((m * 255).astype(np.uint8), (crop.shape[1], crop.shape[0]))
+    _, m_resized = cv2.threshold(m_resized, 255 // 2, 255, cv2.THRESH_BINARY)
+    m_full = np.zeros((h, w), np.uint8)
+    m_full[y0:y0 + m_resized.shape[0], x0:x0 + m_resized.shape[1]] = m_resized
+    return m_full
+
+
+def analyze_mask_topology(fg_mask):
+    """
+    Decide whether a ring-body mask actually corresponds to a physical
+    ring body with a single enclosed hole, from the mask's own CONTOUR
+    HIERARCHY (cv2.RETR_CCOMP) - this directly implements "acceptance
+    should depend on mask topology": one ring body, one enclosed central
+    hole, hole boundary sufficiently complete (solidity), plausible
+    geometry (axis ratio). Only once a mask passes this gate does its
+    hole's ellipse become a candidate measurement.
+
+    The ring BODY is the largest top-level (no-parent) contour; the HOLE
+    is the largest contour whose parent IS that body contour - i.e. the
+    largest region the mask's own topology says is enclosed BY the body,
+    not merely "some background-colored blob we found nearby".
+
+    The convex hull is used ONLY to compute solidity as a validity CHECK
+    ("is this hole boundary complete enough to trust") - the returned
+    ellipse is always fit to the RAW hole contour, never to the hull, so
+    an incomplete/bitten crescent cannot be hull-reconstructed into a
+    convincing-looking measurement (the conceptual gap this revision was
+    explicitly asked to close).
+    """
+    fg_clean = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    fg_clean = cv2.morphologyEx(fg_clean, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+
+    cnts, hier = cv2.findContours(fg_clean, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    if not cnts or hier is None:
+        return {"ok": False, "reason": "NO_CONTOURS"}
+    hier = hier[0]
+
+    top_level = [i for i in range(len(cnts)) if hier[i][3] == -1]
+    if not top_level:
+        return {"ok": False, "reason": "NO_BODY"}
+    body_idx = max(top_level, key=lambda i: cv2.contourArea(cnts[i]))
+    body_area = cv2.contourArea(cnts[body_idx])
+    if body_area < 500:
+        return {"ok": False, "reason": "BODY_TOO_SMALL"}
+    n_bodies = sum(1 for i in top_level if cv2.contourArea(cnts[i]) > 0.15 * body_area)
+
+    children = [i for i in range(len(cnts)) if hier[i][3] == body_idx]
+    if not children:
+        return {"ok": False, "reason": "NO_HOLE", "n_bodies": n_bodies}
+    hole_idx = max(children, key=lambda i: cv2.contourArea(cnts[i]))
+    hole_area = cv2.contourArea(cnts[hole_idx])
+    hole_contour = cnts[hole_idx]
+    n_holes = sum(1 for i in children if cv2.contourArea(cnts[i]) > 0.1 * hole_area)
+    if len(hole_contour) < 5 or hole_area < 100:
+        return {"ok": False, "reason": "HOLE_TOO_SMALL", "n_bodies": n_bodies}
+
+    hull = cv2.convexHull(hole_contour)
+    hull_area = cv2.contourArea(hull)
+    solidity = hole_area / hull_area if hull_area > 0 else 0.0
+
+    ellipse = cv2.fitEllipse(hole_contour)
+    (ecx, ecy), (MA, ma), angle = ellipse
+    axis_ratio = min(MA, ma) / max(MA, ma) if max(MA, ma) > 0 else 0.0
+
+    ok = (n_bodies == 1 and n_holes == 1
+          and solidity >= MIN_HOLE_SOLIDITY
+          and axis_ratio >= MIN_HOLE_AXIS_RATIO)
+    return {
+        "ok": ok,
+        "reason": None if ok else "TOPOLOGY_NOT_CLEAN",
+        "n_bodies": n_bodies,
+        "n_holes": n_holes,
+        "solidity": solidity,
+        "axis_ratio": axis_ratio,
+        "ellipse": ellipse,
+        "diam_px": (MA + ma) / 2.0,
+        "hole_contour": hole_contour,
+        "fg_mask": fg_clean,
+    }
 
 
 def locate_outer_ring_circle(rect_gray, marker_rect):
@@ -651,15 +836,15 @@ def locate_outer_ring_circle(rect_gray, marker_rect):
 
     This is localization only: the returned circle is NEVER used as the
     measurement or as evidence for which boundary is correct - it only
-    tells the rest of measure_ring roughly where to look (sizing
-    segment_hole_candidates' search window, centering
-    sample_background_reference's local background annulus). Which pixels
-    inside that window are actually the hole is decided entirely by
-    segment_hole_candidates' background-color segmentation and its
-    stability-across-thresholds check, so this function does not need to
-    itself validate "is this really a ring" - it only needs a plausible,
-    roughly-correctly-located, roughly-correctly-sized circle to point the
-    rest of the pipeline at.
+    tells the rest of measure_ring roughly where to look (seeding
+    build_band_hypotheses' two radial searches, and sizing the crop window
+    segment_ring_body_mobilesam prompts MobileSAM on). Which pixels inside
+    that window are actually the ring body, and which enclosed region is
+    the hole, is decided entirely by the prompted segmentation and
+    analyze_mask_topology's check on the resulting mask, so this function
+    does not need to itself validate "is this really a ring" - it only
+    needs a plausible, roughly-correctly-located, roughly-correctly-sized
+    circle to point the rest of the pipeline at.
 
     Preference order: a Hough circle that ALSO shows plausible nested
     radial edge structure (checked via radial_inner_candidate) is preferred
@@ -800,128 +985,42 @@ def locate_outer_ring_circle(rect_gray, marker_rect):
     return largest_any
 
 
-def segment_hole_candidates(rect_lab, marker_rect, outer_ring_hint, bg_ref,
-                             z_thresholds=(0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0),
-                             close_ksize=9, open_ksize=5, min_diam_px=20):
+def build_band_hypotheses(rect_gray, marker_rect, outer_ring_hint):
     """
-    THE core detection mechanism of this pipeline (see module docstring's
-    SEGMENTATION-FIRST REVISION). For each candidate z-threshold:
-
-      1. Classify every pixel in a window around the localized ring as
-         "background-colored" (distance from bg_ref's Lab median, scaled
-         by its own robust per-channel noise estimate, <= z) or not. The
-         distance combines chroma (a*/b*) Euclidean distance with a
-         ONE-SIDED brightness term - only being brighter than background
-         counts toward "background-like" on the brightness axis, so a
-         genuinely darker region (a shadow cast BY the ring, or the ring
-         material itself if it's dark) is not mistaken for background
-         just because its chroma happens to be close; a region so much
-         darker than background that it's almost certainly pure shadow
-         (MAX_DARKNESS_Z) is excluded outright rather than folded into the
-         distance metric, matching the asymmetric logic this pipeline has
-         used for background/material contrast since the very first
-         revision.
-      2. Clean the mask: MORPH_OPEN (drop thin false-positive speckle from
-         isolated noisy pixels) then MORPH_CLOSE (seal small real gaps -
-         e.g. a thin glare streak across the hole - so the enclosed region
-         isn't fragmented by something that wouldn't fragment a human's
-         reading of the same photo).
-      3. Find the largest connected component of this mask that does NOT
-         touch the window border. This is, by construction, the ring's
-         enclosed hole: everywhere else "background-colored" pixels touch
-         the border of the window (because the actual background is
-         outside the ring), but the hole is background visible *through*
-         the ring, so it alone forms a closed island.
-      4. Take that component's convex hull before fitting an ellipse.
-         Rationale: the true hole opening is convex (it's the silhouette
-         of a round hole), but a local brightness gradient, partial
-         reflection, or shadow can locally fail the background-likeness
-         test along part of the true boundary, biting a non-convex notch
-         out of the raw thresholded region without the hole itself having
-         that shape. The hull corrects for that without assuming anything
-         about WHERE the notch will be, since it is computed purely from
-         the component's own shape.
-
-    Returns a list of dicts (one per z that produced a usable region),
-    each with: z, ellipse, diam_px, center, axis_ratio, area (hull area in
-    px^2). Does NOT decide accept/reject - that is measure_ring's job,
-    based on how these z-indexed candidates behave as a group (stability,
-    shape) - this function never compares candidates to each other, it
-    only ever looks at one region per threshold.
+    Build both readings of outer_ring_hint per the module docstring's
+    TWO-HYPOTHESIS STRATEGY, returning a list of (label, inner_r, outer_r)
+    tuples - zero, one, or two entries depending on how much radial edge
+    signal this photo actually has. Degenerate pairs (outer_r not
+    meaningfully larger than inner_r) are dropped here so callers never
+    have to special-case them.
     """
-    if bg_ref is None or outer_ring_hint is None:
-        return []
-
     cx, cy, r = outer_ring_hint
-    h, w = rect_lab.shape[:2]
-    win_r = int(np.ceil(r * 1.3))
-    x0 = max(0, int(cx - win_r)); x1 = min(w, int(cx + win_r + 1))
-    y0 = max(0, int(cy - win_r)); y1 = min(h, int(cy + win_r + 1))
-    win_lab = rect_lab[y0:y1, x0:x1]
-
-    lab_med, lab_mad = bg_ref["lab_median"], bg_ref["lab_mad"]
-    scale = np.maximum(lab_mad, 3.0)
-    chroma_dist = np.sqrt((((win_lab[:, :, 1:] - lab_med[1:]) / scale[1:]) ** 2).sum(axis=2))
-    brightness_signed = (win_lab[:, :, 0] - lab_med[0]) / scale[0]
-    MAX_DARKNESS_Z = 6.0
-    too_dark = brightness_signed < -MAX_DARKNESS_Z
-    dist = np.where(too_dark, np.inf, np.maximum(chroma_dist, np.clip(brightness_signed, 0, None)))
-
+    probe = cv2.Canny(rect_gray, 40, 120)
+    probe = cv2.morphologyEx(probe, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     mx0, my0, mx1, my1 = marker_rect
     pad = MARKER_MASK_PAD_PX
-    mmy0 = max(0, int(my0 - pad) - y0); mmy1 = min(win_lab.shape[0], int(my1 + pad) - y0)
-    mmx0 = max(0, int(mx0 - pad) - x0); mmx1 = min(win_lab.shape[1], int(mx1 + pad) - x0)
+    cv2.rectangle(
+        probe,
+        (max(0, int(mx0 - pad)), max(0, int(my0 - pad))),
+        (min(probe.shape[1] - 1, int(mx1 + pad)), min(probe.shape[0] - 1, int(my1 + pad))),
+        0, -1,
+    )
 
-    out = []
-    for z in z_thresholds:
-        bg_like = (dist <= z).astype(np.uint8) * 255
-        bg_like = cv2.morphologyEx(bg_like, cv2.MORPH_OPEN, np.ones((open_ksize, open_ksize), np.uint8))
-        bg_like = cv2.morphologyEx(bg_like, cv2.MORPH_CLOSE, np.ones((close_ksize, close_ksize), np.uint8))
-        if mmy1 > mmy0 and mmx1 > mmx0:
-            bg_like[mmy0:mmy1, mmx0:mmx1] = 0
+    hypotheses = []
 
-        num_labels, labels = cv2.connectedComponents(bg_like, connectivity=8)
-        border_labels = set(labels[0, :].tolist()) | set(labels[-1, :].tolist()) | \
-                         set(labels[:, 0].tolist()) | set(labels[:, -1].tolist())
-        border_labels.discard(0)
+    # H1: outer_ring_hint IS the outer edge; search inward for the hole.
+    inner_cand = radial_inner_candidate(rect_gray, probe, (cx, cy), r,
+                                         min_band_ratio=1.05, max_band_ratio=3.0)
+    if inner_cand is not None:
+        hypotheses.append(("r=outer", inner_cand["diam_px"] / 2.0, r))
 
-        best = None
-        for lbl in range(1, num_labels):
-            if lbl in border_labels:
-                continue
-            comp = (labels == lbl).astype(np.uint8) * 255
-            area = int(np.count_nonzero(comp))
-            if area < 200:
-                continue
-            cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-            if not cnts:
-                continue
-            c = max(cnts, key=cv2.contourArea)
-            hull = cv2.convexHull(c)
-            if len(hull) < 5:
-                continue
-            ellipse = cv2.fitEllipse(hull)
-            (ecx, ecy), (MA, ma), angle = ellipse
-            if MA == 0 or ma == 0 or MA < min_diam_px:
-                continue
-            axis_ratio = min(MA, ma) / max(MA, ma)
-            hull_area = cv2.contourArea(hull)
-            if best is None or hull_area > best[1]:
-                best = (comp, hull_area, ellipse, axis_ratio)
+    # H2: outer_ring_hint IS the hole edge; search outward for the band.
+    outer_cand = radial_outer_candidate(rect_gray, probe, (cx, cy), r)
+    if outer_cand is not None:
+        hypotheses.append(("r=inner", r, outer_cand["radius"]))
 
-        if best is not None:
-            comp, area, ellipse, axis_ratio = best
-            (ecx, ecy), (MA, ma), angle = ellipse
-            full_ellipse = ((ecx + x0, ecy + y0), (MA, ma), angle)
-            out.append({
-                "z": z,
-                "ellipse": full_ellipse,
-                "diam_px": (MA + ma) / 2.0,
-                "center": (ecx + x0, ecy + y0),
-                "axis_ratio": axis_ratio,
-                "area": area,
-            })
-    return out
+    return [(label, inner_r, outer_r) for (label, inner_r, outer_r) in hypotheses
+            if outer_r > inner_r * 1.03]
 
 
 def measure_ring(photo, verbose_name=""):
@@ -947,12 +1046,11 @@ def measure_ring(photo, verbose_name=""):
         return res
 
     rect_gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
-    rect_lab = cv2.cvtColor(rectified, cv2.COLOR_BGR2LAB).astype(np.float32)
 
     # Coarse ROI localization ONLY - see locate_outer_ring_circle's
     # docstring. It tells the rest of this function roughly WHERE the ring
-    # is; WHICH pixels inside that area are the true hole is decided
-    # entirely by segment_hole_candidates below.
+    # is; WHICH pixels are the true ring body/hole is decided entirely by
+    # the prompted MobileSAM segmentation + mask-topology analysis below.
     outer_ring_hint = locate_outer_ring_circle(rect_gray, marker_rect)
     if outer_ring_hint is None:
         res.reason = "RING_NOT_FOUND"
@@ -961,147 +1059,108 @@ def measure_ring(photo, verbose_name=""):
     if os.environ.get("RING_DEBUG"):
         print(f"[RING_DEBUG] outer_ring_hint diam_mm={2*outer_ring_hint[2]/PX_PER_MM_OUT:.2f}")
 
-    # Background-color reference is now HARD-REQUIRED: it's the primary
-    # signal segment_hole_candidates classifies every pixel against, not a
-    # secondary/optional cue (see sample_background_reference's and the
-    # module docstring's discussion of this reinstatement).
-    bg_ref = sample_background_reference(rectified, marker_rect, outer_ring_hint)
-    if bg_ref is None:
-        res.reason = "BACKGROUND_REFERENCE_UNAVAILABLE"
-        return res
-
-    candidates = segment_hole_candidates(rect_lab, marker_rect, outer_ring_hint, bg_ref)
-
-    res.candidates_mm = [
-        (c["z"], c["diam_px"] / PX_PER_MM_OUT, c) for c in candidates
-    ]
-    res.family_estimates = {
-        f"z={c['z']:.2f}": c["diam_px"] / PX_PER_MM_OUT for c in candidates
-    }
-
-    def draw_debug(final_candidate=None, reason_note=None):
+    def draw_debug(winner=None, reason_note=None):
         """Built once the outcome is known. Draws the localization ROI,
-        every z-threshold's candidate ellipse in a threshold-indexed color
-        (lightest z = coolest color, loosest z = warmest), and the final
-        accepted ellipse (if any) bold on top. Rejected-photo overlays
-        still show the full sweep, since that is the useful debugging
-        signal under this architecture (there is no "rejected candidate
-        list" distinct from "the sweep" any more - the sweep IS the
-        evidence, accepted or not)."""
+        every hypothesis's ring-body mask (tinted, one color per
+        hypothesis) and hole contour, and the winning ellipse (if any)
+        bold on top."""
         dbg = rectified.copy()
         line_thickness = max(3, dbg.shape[1] // 300)
+        ocx, ocy, orad = outer_ring_hint
+        cv2.circle(dbg, (int(ocx), int(ocy)), int(orad), (200, 200, 200), max(1, line_thickness // 2))
 
-        if outer_ring_hint is not None:
-            ocx, ocy, orad = outer_ring_hint
-            cv2.circle(dbg, (int(ocx), int(ocy)), int(orad), (200, 200, 200), max(1, line_thickness // 2))
+        palette = {"r=outer": (255, 140, 0), "r=inner": (0, 200, 255)}
+        for label, inner_r, outer_r, topo in attempts:
+            if not topo.get("ok"):
+                continue
+            color = palette.get(label, (0, 180, 0))
+            overlay = dbg.copy()
+            overlay[topo["fg_mask"] > 0] = color
+            dbg = cv2.addWeighted(overlay, 0.30, dbg, 0.70, 0)
+            cv2.drawContours(dbg, [topo["hole_contour"]], -1, color, 2)
 
-        n = max(1, len(candidates))
-        for i, c in enumerate(candidates):
-            t = i / max(1, n - 1)
-            color = (int(255 * (1 - t)), 80, int(255 * t))  # blue (tight) -> red (loose)
-            cv2.ellipse(dbg, c["ellipse"], color, max(1, line_thickness // 2))
-            if os.environ.get("RING_DEBUG_OVERLAY"):
-                (ecx, ecy), _, _ = c["ellipse"]
-                label = f"z={c['z']:.2f} {c['diam_px']/PX_PER_MM_OUT:.2f}mm ar={c['axis_ratio']:.2f}"
-                cv2.putText(dbg, label, (max(0, int(ecx) - 60), max(15, int(ecy))),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-
-        if final_candidate is not None:
-            cv2.ellipse(dbg, final_candidate["ellipse"], (255, 255, 255), line_thickness + 2)
+        if winner is not None:
+            label, inner_r, outer_r, topo = winner
+            cv2.ellipse(dbg, topo["ellipse"], (255, 255, 255), line_thickness + 2)
 
         if reason_note and os.environ.get("RING_DEBUG_OVERLAY"):
             cv2.putText(dbg, reason_note, (20, dbg.shape[0] - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
-
         return dbg
 
-    if os.environ.get("RING_DEBUG"):
-        for c in candidates:
-            print(f"[RING_DEBUG] z={c['z']:.2f} diam_mm={c['diam_px']/PX_PER_MM_OUT:.2f} "
-                  f"axis_ratio={c['axis_ratio']:.2f} area={c['area']:.0f}")
-
-    if len(candidates) < 2:
-        # Not enough of the sweep produced an enclosed background region at
-        # all - there's no mask behavior to judge stability/shape from.
-        res.reason = "HOLE_NOT_FOUND"
-        res.debug_img = draw_debug(reason_note="HOLE_NOT_FOUND")
+    hypotheses = build_band_hypotheses(rect_gray, marker_rect, outer_ring_hint)
+    if not hypotheses:
+        # Neither radial search (inward or outward from the hint) found a
+        # plausible second radius at all - there is no (inner_r, outer_r)
+        # band to even prompt a segmenter with.
+        res.reason = "NO_BAND_HYPOTHESIS"
+        attempts = []
+        res.debug_img = draw_debug(reason_note="NO_BAND_HYPOTHESIS")
         return res
 
-    # --- Stability across the z-sweep is the accept/reject signal. ---
-    #
-    # Reasoned from first principles, not fitted to any known diameter (see
-    # module docstring): as z loosens, a real hole's recovered mask should
-    # grow while it's still catching genuine hole-boundary pixels that a
-    # tighter threshold missed, then STOP growing once it has - further
-    # loosening should not keep adding real information, because there's
-    # nothing further out that's actually hole. If the diameter is still
-    # changing meaningfully even between the two LOOSEST thresholds tried,
-    # the mask has not found a stable stopping point and is (or soon will
-    # be) eating into ring material, a shadow, or background beyond the
-    # ring - not a trustworthy boundary.
-    #
-    # STABILITY_TOL_MM=0.5: half a millimeter of residual drift between the
-    # two loosest candidates tried is small relative to the physical sizes
-    # in scope here (10-40mm outer diameter) and was the point at which
-    # every clean-signal test case (real and synthetic) was already well
-    # below, while the one genuinely ambiguous real photo (a knurled,
-    # serrated cap with a real brightness gradient across its opening) was
-    # clearly and separately above it even after widening the z-range.
-    STABILITY_TOL_MM = 0.5
-
-    # MIN_AXIS_RATIO_FOR_ACCEPT=0.75: once stable, the region's own shape
-    # has to be reasonably close to circular/elliptical - a stable but
-    # badly-non-elliptical region is evidence the mask locked onto a
-    # boundary shape that ISN'T a round hole (e.g. it fused with a notch or
-    # an adjacent shadow), not that the true hole is unusually eccentric. A
-    # genuinely elliptical hole from meaningful photo angle is handled by
-    # detect_and_rectify's side_ratio/PERSPECTIVE_TOO_HIGH gate upstream, so
-    # axis_ratio this low at the measurement stage is a segmentation
-    # problem, not a real perspective ellipse.
-    MIN_AXIS_RATIO_FOR_ACCEPT = 0.75
-
-    candidates_sorted = sorted(candidates, key=lambda c: c["z"])
-    loosest = candidates_sorted[-1]
-    second_loosest = candidates_sorted[-2]
-    loosest_diam_mm = loosest["diam_px"] / PX_PER_MM_OUT
-    second_diam_mm = second_loosest["diam_px"] / PX_PER_MM_OUT
-    last_delta_mm = abs(loosest_diam_mm - second_diam_mm)
-
-    # How many of the loosest candidates (walking inward from the loosest)
-    # stay within tolerance of the loosest one - purely a reporting/debug
-    # signal, not itself a gate.
-    n_stable = 1
-    for c in reversed(candidates_sorted[:-1]):
-        if abs(c["diam_px"] / PX_PER_MM_OUT - loosest_diam_mm) <= STABILITY_TOL_MM:
-            n_stable += 1
-        else:
-            break
-
-    if os.environ.get("RING_DEBUG"):
-        print(f"[RING_DEBUG] last_delta_mm={last_delta_mm:.3f} "
-              f"loosest_axis_ratio={loosest['axis_ratio']:.3f} n_stable={n_stable}")
-
-    if last_delta_mm > STABILITY_TOL_MM:
-        res.reason = "MASK_AMBIGUOUS"
-        res.detection_spread_mm = last_delta_mm
-        res.debug_img = draw_debug(reason_note=f"MASK_AMBIGUOUS delta={last_delta_mm:.2f}mm")
+    sam_model = _get_sam_model()
+    if sam_model is None:
+        res.reason = "SEGMENTATION_MODEL_UNAVAILABLE"
+        attempts = []
+        res.debug_img = draw_debug(reason_note="SEGMENTATION_MODEL_UNAVAILABLE")
         return res
 
-    if loosest["axis_ratio"] < MIN_AXIS_RATIO_FOR_ACCEPT:
+    # Run MobileSAM + mask-topology analysis independently for every
+    # hypothesis - see module docstring's TWO-HYPOTHESIS STRATEGY. Each
+    # entry is (label, inner_r, outer_r, topo_dict); topo_dict["ok"] is
+    # False (with a "reason") when that hypothesis didn't pan out.
+    attempts = []
+    for label, inner_r, outer_r in hypotheses:
+        cx, cy, _ = outer_ring_hint
+        fg = segment_ring_body_mobilesam(rectified, sam_model, cx, cy, inner_r, outer_r)
+        if fg is None:
+            attempts.append((label, inner_r, outer_r, {"ok": False, "reason": "NO_MASK"}))
+            continue
+        topo = analyze_mask_topology(fg)
+        attempts.append((label, inner_r, outer_r, topo))
+
+    if os.environ.get("RING_DEBUG"):
+        for label, inner_r, outer_r, topo in attempts:
+            status = "OK" if topo["ok"] else f"REJECT({topo['reason']})"
+            print(f"[RING_DEBUG] [{label}] inner_r={inner_r:.1f} outer_r={outer_r:.1f} -> {status} "
+                  f"solidity={topo.get('solidity', 0):.2f} axis_ratio={topo.get('axis_ratio', 0):.2f}")
+
+    res.rejected_candidates = [
+        (label, topo.get("reason")) for label, inner_r, outer_r, topo in attempts if not topo["ok"]
+    ]
+    valid = [(label, inner_r, outer_r, topo) for label, inner_r, outer_r, topo in attempts if topo["ok"]]
+
+    res.candidates_mm = [(label, topo["diam_px"] / PX_PER_MM_OUT, topo) for label, _, _, topo in valid]
+    res.family_estimates = {label: topo["diam_px"] / PX_PER_MM_OUT for label, _, _, topo in valid}
+
+    if not valid:
+        # Every hypothesis that reached segmentation either produced no
+        # mask at all, or a mask whose topology did not pass the
+        # single-body/single-hole/solidity/shape gate - per the explicit
+        # instruction to inspect mask correctness rather than force a
+        # number through, this is an honest retake, not a best-effort
+        # guess from whichever attempt looked least bad.
         res.reason = "HOLE_NOT_SUFFICIENTLY_VISIBLE"
-        res.detection_spread_mm = last_delta_mm
-        res.debug_img = draw_debug(reason_note=f"HOLE_NOT_SUFFICIENTLY_VISIBLE ar={loosest['axis_ratio']:.2f}")
+        res.debug_img = draw_debug(reason_note="HOLE_NOT_SUFFICIENTLY_VISIBLE")
         return res
 
-    # ACCEPT: report the loosest STABLE candidate - the loosest threshold
-    # that hasn't started growing into non-hole material is the one most
-    # likely to have recovered the hole's full true extent rather than an
-    # undersized, overly-conservative core of it.
+    # Prefer the hypothesis with the higher hole solidity - the more
+    # convex, more complete-looking boundary. When both hypotheses are
+    # valid, their agreement is reported (detection_spread_mm) as an extra
+    # confidence signal, not used to override the solidity choice.
+    winner = max(valid, key=lambda t: t[3]["solidity"])
+    label, inner_r, outer_r, topo = winner
+    diam_mm = topo["diam_px"] / PX_PER_MM_OUT
+
     res.ok = True
-    res.diameter_mm = loosest_diam_mm
-    res.detection_spread_mm = max(last_delta_mm, 0.05)  # floor so we never claim impossible precision
-    res.hole_axis_ratio = loosest["axis_ratio"]
-    res.z_threshold_used = loosest["z"]
-    res.n_stable_z = n_stable
-    res.debug_img = draw_debug(final_candidate=loosest)
+    res.diameter_mm = diam_mm
+    res.hypothesis_used = label
+    res.mask_solidity = topo["solidity"]
+    res.hole_axis_ratio = topo["axis_ratio"]
+    res.n_bodies = topo["n_bodies"]
+    res.n_holes = topo["n_holes"]
+    if len(valid) == 2:
+        other_diam_mm = [t[3]["diam_px"] / PX_PER_MM_OUT for t in valid if t is not winner][0]
+        res.detection_spread_mm = abs(diam_mm - other_diam_mm)
+    res.debug_img = draw_debug(winner=winner)
     return res

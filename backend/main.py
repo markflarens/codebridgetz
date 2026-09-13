@@ -49,18 +49,12 @@ RETAKE_MESSAGES = {
     "BLUR": "Photo is too blurry. Hold the phone steady and retake.",
     "UNDEREXPOSED": "Photo is too dark. Move to a brighter area and retake.",
     "OVEREXPOSED": "Photo is too bright or reflective. Use softer, more even light and avoid direct reflections on the ring or marker, then retake.",
-    # BACKGROUND_REFERENCE_UNAVAILABLE reinstated (segmentation-first
-    # redesign): background color is now the primary signal the whole
-    # measurement is built from, not a secondary cue - see pipeline.py's
-    # module docstring. A photo with no usable background sample cannot be
-    # segmented at all, so this is an honest, hard retake reason again.
-    "BACKGROUND_REFERENCE_UNAVAILABLE": "Could not sample a clear background/table color around the ring. Use a plainer, more evenly lit surface, or move the ring away from clutter, and retake.",
     "RING_NOT_FOUND": "Ring edge is unclear. Avoid reflections and place the ring on a contrasting surface.",
-    # segmentation-first redesign reason codes - see pipeline.py's
-    # segment_hole_candidates()/measure_ring() for exactly what triggers
-    # each one.
-    "HOLE_NOT_FOUND": "Could not find the ring's inner hole against the background. Make sure the hole is clearly visible and place the ring on a contrasting, evenly lit surface.",
-    "MASK_AMBIGUOUS": "Ring edge is unclear. Avoid reflections and shadows inside the hole, and place the ring on a contrasting, evenly lit surface.",
+    # Ring-body / mask-topology redesign reason codes - see pipeline.py's
+    # module docstring and measure_ring() for exactly what triggers each
+    # one.
+    "NO_BAND_HYPOTHESIS": "Could not identify the ring's band and opening well enough to attempt segmentation. Make sure the whole ring is in sharp focus with clear edges, directly from above.",
+    "SEGMENTATION_MODEL_UNAVAILABLE": "The measurement service is temporarily unavailable. Please try again shortly.",
     "HOLE_NOT_SUFFICIENTLY_VISIBLE": "The ring's inner hole isn't clearly enough visible to measure reliably. Avoid shadows or reflections across the hole and retake from directly above.",
     "INCONSISTENT_DETECTION": "Detected more than one possible circular object. Make sure only one ring is in the photo, away from other round objects.",
 }
@@ -186,7 +180,10 @@ async def measure(file: UploadFile = File(...)):
         "sizing_standard": size_info["standard"],
         "sizing_source": size_info["source"],
         "rounding_rule": size_info["rounding_rule"],
-        "detection_spread_mm": round(result.detection_spread_mm, 2),
+        # None when only one hypothesis produced a valid mask topology -
+        # there is nothing to compare it against (see pipeline.py's
+        # MeasurementResult docstring).
+        "detection_spread_mm": round(result.detection_spread_mm, 2) if result.detection_spread_mm is not None else None,
         "family_estimates": {k: round(v, 2) for k, v in result.family_estimates.items()},
         "processing_time_ms": elapsed_ms,
         "overlay_image": overlay_b64,

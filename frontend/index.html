@@ -153,7 +153,7 @@
 
     <div class="datagrid">
       <div class="datagrid__cell">
-        <span class="datagrid__label">Cross-method spread</span>
+        <span class="datagrid__label">Cross-hypothesis spread</span>
         <span class="datagrid__value" id="data-spread">—</span>
       </div>
       <div class="datagrid__cell">
@@ -168,7 +168,7 @@
 
     <details class="disclosure disclosure--block">
       <summary>What "spread" means</summary>
-      <p>The ring's inner hole is found by segmenting the photo against its own sampled background color at a sweep of thresholds, then checking that the recovered boundary stops changing once the threshold is loose enough. Spread is the remaining size difference between the two loosest thresholds tried. It is <strong>not</strong> a physical measurement uncertainty (it says nothing about printer scale error, lens distortion, or marker-corner localization error). A low spread means the boundary had already stabilized; it is a stability signal, not an accuracy guarantee.</p>
+      <p>The ring's outer edge is coarsely localized first, then read two ways - as the outer edge itself, and as the inner hole edge - and a small segmentation model is prompted separately for each reading to find the ring's own band material and, from its mask's shape, the enclosed hole. When both readings independently produce a valid mask, spread is the size difference between them. It is <strong>not</strong> a physical measurement uncertainty (it says nothing about printer scale error, lens distortion, or marker-corner localization error) - it is how much the two independent readings of this one photo agree with each other. When only one reading produced a valid mask, there is nothing to compare it against and this shows "n/a".</p>
     </details>
 
     <details class="disclosure disclosure--block">
@@ -179,7 +179,7 @@
 
     <details class="disclosure disclosure--block">
       <summary>Measurement details (technical)</summary>
-      <p>Number of segmentation thresholds that produced a usable boundary: <span id="data-methods">—</span>.</p>
+      <p>Number of band-hypotheses that produced a valid ring-body/hole mask: <span id="data-methods">—</span>.</p>
       <p id="data-family-estimates" class="mono-small"></p>
     </details>
   </section>

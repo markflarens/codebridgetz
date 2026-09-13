@@ -6,3 +6,8 @@ venv/
 .DS_Store
 test_set_log.csv
 *_debug.png
+
+# MobileSAM checkpoint (~39MB) - downloaded at Docker BUILD time (see
+# Dockerfile) rather than committed, to keep the repo/patches a reasonable
+# size. Run locally: python3 -c "from ultralytics import SAM; SAM('backend/weights/mobile_sam.pt')"
+backend/weights/

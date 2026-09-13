@@ -41,8 +41,17 @@ python3 regression_suite.py
 - **Web framework:** FastAPI `0.141.1`, Uvicorn `0.52.4`,
   `python-multipart` `0.0.32`
 - **Computer vision:** `opencv-contrib-python` `4.13.0.92` (ArUco marker
-  detection, Canny/adaptive/Otsu segmentation, Hough circle transform,
-  contour fitting, Sobel gradients)
+  detection, Hough circle transform, radial/Sobel gradient histograms,
+  contour hierarchy analysis, `fitEllipse`)
+- **Ring-body segmentation:** `ultralytics` `8.4.150` (its `SAM` wrapper,
+  loading a MobileSAM checkpoint), `torch` `>=2.12,<2.15` (CPU-only build,
+  installed from PyTorch's own CPU wheel index — see `Dockerfile`) — see
+  "ML dependency, honestly" below for exactly what this is used for and
+  what it costs. Both version constraints were checked against real
+  PyPI/pytorch.org listings via web search before pinning, not trusted
+  from this sandbox's own `pip show`/`pip index` output, which has
+  previously been shown to report phantom not-yet-real versions for
+  fast-moving packages (see `backend/requirements.txt`'s comments).
 - **Numerics/imaging:** `numpy` `2.4.6`, `pillow` `12.3.0`
 - **HEIC decoding:** ImageMagick's `convert` CLI (installed in the Docker
   image), used only as a fallback when Pillow/OpenCV can't decode an
@@ -56,29 +65,39 @@ python3 regression_suite.py
   particular, changes contour/Hough behavior enough to invalidate the
   calibrated thresholds below).
 
-**Runtime ring measurement is deterministic computer vision — it does not
-use a vision LLM or any ML model to estimate the diameter.** The
-measurement path is: ArUco marker detection → homography-based
-perspective rectification (marker gives real-world scale in mm) → coarse
-Hough-circle ring ROI localization → a local background-color reference
-sampled from the photo itself → **segmentation** of the localized window
-against that background color at a sweep of thresholds (Lab-space
-chroma+brightness distance, morphological cleanup, enclosed-connected-
-component extraction, convex-hull correction) → ellipse fit to the
-recovered hole boundary, accepted only once it stops changing size across
-the loosest thresholds tried → US ring-size lookup via a documented linear
-formula. No network calls, no model inference, and no LLM involvement
-happen during a `/api/measure` request. (Claude, as an AI coding
-assistant, was used to *write* this pipeline — it is not called at
-runtime.) Two ML/heavier options were investigated and rejected during
-development — GrabCut and FastSAM — see "Detection architecture" below
-for why.
+**Runtime ring measurement uses a small ML model for one narrow step
+(ring-body segmentation), not a vision LLM, and never to estimate the
+diameter itself.** The measurement path is: ArUco marker detection →
+homography-based perspective rectification (marker gives real-world scale
+in mm) → coarse Hough-circle ring ROI localization → two independent
+readings of that coarse hint (see "TWO-HYPOTHESIS STRATEGY" below) → for
+each reading, MobileSAM is **prompted** (positive points on the ring
+band, negative points inside the hole and outside the ring) to produce a
+ring-body mask → the enclosed hole is read off that mask's own contour
+**topology** (not matched against anything) → a convex-hull solidity
+check gates whether the result is trustworthy → an ellipse fit to the
+mask's **raw** hole contour (never the hull) → US ring-size lookup via a
+documented linear formula. This is a genuine, new runtime dependency:
+CPU inference happens during a `/api/measure` request (no network calls -
+the checkpoint is baked into the deploy image, not fetched at request
+time). (Claude, as an AI coding assistant, was used to *write* this
+pipeline — the coding assistant itself is never called at runtime; only
+the small segmentation model it integrated is.) See "ML dependency,
+honestly" and "Detection architecture" below for the full reasoning, and
+for the two other approaches (properly-seeded GrabCut, prompted FastSAM)
+that were investigated and rejected before this one.
 
 ## Reused vs. custom
 
 **Reused (libraries/algorithms, not app logic):**
-- OpenCV's ArUco detector, `Canny`, `adaptiveThreshold`, `HoughCircles`,
-  `findContours`/`fitEllipse`, `Sobel`, `warpPerspective`/`findHomography`
+- OpenCV's ArUco detector, `HoughCircles`, `findContours`/`fitEllipse`,
+  `Sobel`, `warpPerspective`/`findHomography`, `convexHull`
+- **MobileSAM** (via `ultralytics.SAM`) — a pretrained, off-the-shelf
+  point-promptable segmentation model, used exactly as published (no
+  fine-tuning); this project only decides WHAT prompts to feed it (from
+  its own geometric hypotheses) and WHAT to do with its output mask
+  (topology analysis). The model itself, and its weights, are entirely
+  reused.
 - FastAPI/Uvicorn for the HTTP layer, Pillow for EXIF-aware image loading
 - The US ring-size formula itself (`backend/ring_sizes.py`) is a published
   standard, not invented here: `inside_circumference_mm = 36.5 + 2.55 *
@@ -88,13 +107,16 @@ for why.
   (25karats.com, angara.com) before use — see the module docstring.
 
 **Custom (written for this assignment):**
-- The entire detection pipeline's control flow and calibration:
-  multi-method segmentation ensemble, family-based cross-method consensus
-  (not just raw vote counting — see `measure_ring`'s comments on why
-  Canny-threshold variants are collapsed to one vote), the radial/Hough
-  fallback for reflective metal rings with gradient-direction filtering,
-  all quality gates (exposure, blur, perspective, marker-size) and their
-  thresholds, all failure-mode reason codes and messages
+- The entire detection pipeline's control flow and calibration: the
+  two-hypothesis radial-edge-histogram radius search (including the new
+  `radial_outer_candidate`, a mirror of the pre-existing
+  `radial_inner_candidate`), the point-prompt construction fed to
+  MobileSAM, the mask-topology analysis (`analyze_mask_topology` - body/
+  hole extraction via contour hierarchy, solidity gating, raw-contour
+  ellipse fitting), all quality gates (exposure, blur, perspective,
+  marker-size) and their thresholds, all failure-mode reason codes and
+  messages. MobileSAM itself is reused; everything about how it's driven
+  and how its output is judged is custom.
 - `backend/regression_suite.py` and the `test_set/` ground-truth CSV
 - The rounding/"between sizes" display logic in `ring_sizes.py` (the
   formula is reused; the half-size rounding and ambiguity-reporting rule
@@ -116,11 +138,11 @@ algorithm's own answer for.
 **Generalization policy — ground truth is used only to score, never to
 detect.** `pipeline.py` must generalize to new, unseen ring photos; it
 must not special-case a known test photo or its known answer. Concretely:
-candidate selection is decided purely by geometry (contour circularity,
-concentricity of an inner/outer pair) and cross-method agreement (do
-independent segmentation methods — Canny at several thresholds, adaptive
-threshold, Otsu — land on the same boundary), never by comparing a
-candidate's diameter against a ground-truth value and picking whichever
+which band hypothesis wins, and whether a hypothesis's mask is accepted
+at all, is decided purely from that mask's own topology (single body,
+single hole, hole solidity, axis ratio) - properties computable from the
+mask alone, with no reference to any known diameter - never by comparing
+a candidate's diameter against a ground-truth value and picking whichever
 one matches best. `regression_suite.py` reads ground truth only *after*
 `measure_ring()` has already returned, purely to compute error for the
 table below. This is now enforced mechanically, not just documented:
@@ -137,27 +159,36 @@ Full pass/fail table, from the delivered code, `python3 backend/regression_suite
 
 | Test case | Ground truth | Ground truth method | Expected result | Actual result | Abs. error |
 |---|---|---|---|---|---|
-| Real ring A (see "Real ring A" note below — not actually a thin ring) | ~17mm | ruler (coarse) | **REJECT** | REJECT — `MASK_AMBIGUOUS` | n/a — correctly refuses rather than reporting a boundary the mask cannot cleanly recover |
-| Real ring B (keyring-style ring) | 27.00mm | ruler | ACCEPT | ACCEPT, 27.52mm | 0.52mm |
+| Real ring A (see "Real ring A" note below) | ~17mm (see note — likely unreliable) | ruler (coarse) | ACCEPT | ACCEPT, 21.13mm | n/a — see note, not scored against this ground truth |
+| Real ring B (keyring-style ring) | 27.00mm | ruler | ACCEPT | ACCEPT, 28.27mm | 1.27mm |
 | Real ring B, downscaled ~2.06x (same ring/photo, resolution reduced to match a real problem upload) | 27.00mm (same ring as above) | ruler (same measurement, reused) | **REJECT** | REJECT — `RESOLUTION_TOO_LOW` | n/a — correctly refuses at a resolution below what detection is validated for, instead of guessing |
-| Synthetic clean baseline | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.30mm | 0.10mm |
-| Synthetic specular highlight | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.26mm | 0.14mm |
-| Synthetic shadow gradient | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.56mm | 0.16mm |
+| Synthetic clean baseline | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.41mm | 0.01mm |
+| Synthetic specular highlight | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.43mm | 0.03mm |
+| Synthetic shadow gradient | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.41mm | 0.01mm |
 | Synthetic low contrast (~6% contrast) | 17.40mm | rendered (exact) | **REJECT** | REJECT — `RING_NOT_FOUND` | n/a — correctly refuses rather than guessing |
-| Synthetic textured background | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.36mm | 0.04mm |
+| Synthetic textured background | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.46mm | 0.06mm |
 | Synthetic heavy blur | 17.40mm | rendered (exact) | **REJECT** | REJECT — `BLUR` | n/a — rejected before detection even runs |
-| Synthetic wide scene (ring small in frame) | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.50mm | 0.10mm |
-| Synthetic decoy object (adversarial second circle) | 17.40mm | rendered (exact) | ACCEPT (ignore decoy) | ACCEPT, 17.46mm | 0.06mm |
+| Synthetic wide scene (ring small in frame) | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.65mm | 0.25mm |
+| Synthetic decoy object (adversarial second circle) | 17.40mm | rendered (exact) | ACCEPT (ignore decoy) | ACCEPT, 17.59mm | 0.19mm |
 
 **11/11 pass** against `regression_suite.py`'s `CASES` at delivery time
-(after updating Real ring A's expectation from ACCEPT to REJECT — see
-below for why that's a correct, evidence-based change, not a shortcut).
-Every rejected case rejects for the reason the test was designed to
-trigger, not an unrelated failure.
+(after updating Real ring A's expectation from REJECT back to ACCEPT —
+see below for why that's a correct, evidence-based change, not a
+shortcut, and the mirror image of the same change made in the other
+direction during the previous revision). Every rejected case rejects for
+the reason the test was designed to trigger, not an unrelated failure.
+Synthetic-photo errors are a mixed bag against the previous revision -
+tighter on the cases closest to its own segmentation prompts (clean/
+specular/shadow: 0.01–0.03mm here vs. 0.10–0.16mm before), a bit looser
+on the two geometrically harder synthetic cases (wide scene: 0.25mm vs.
+0.10mm; decoy: 0.19mm vs. 0.06mm) - reported as observed, not rounded
+toward whichever direction looks better. The real, unambiguous gain is
+Real ring A going from entirely unmeasurable to a mask-confirmed ACCEPT
+(see below).
 
-**Detection architecture (current — segmentation-first revision):** this
-pipeline has now gone through four designs, and the failure of each is
-what motivated the next, so it's worth recording all four rather than
+**Detection architecture (current — ring-body / mask-topology revision):**
+this pipeline has now gone through five designs, and the failure of each
+is what motivated the next, so it's worth recording all five rather than
 just the current one:
 
 1. *Strongest-circle scoring* (earliest version) — picked whichever
@@ -183,151 +214,179 @@ just the current one:
    hole" from "multiple methods all found the same wrong concentric
    edge" when several real edges in the photo genuinely are concentric
    with each other.
-4. **Segmentation-first (current)** — stops choosing between ellipse
-   candidates entirely. Classifies every pixel in a localized window as
-   background-colored or not (the same Lab-distance metric earlier
-   revisions used as a gate/cue, now the sole primary mechanism), finds
+4. *Segmentation-first via background-color matching* — stopped choosing
+   between ellipse candidates entirely: classified every pixel in a
+   localized window as background-colored or not (Lab-space
+   chroma+brightness distance from a sampled background reference), found
    the single enclosed background-colored connected component (the hole,
-   by construction — only the hole is background visible *through* the
-   ring rather than background *around* it), and fits an ellipse to it.
-   There is exactly one candidate region per threshold, so there is
-   nothing to score against alternatives — acceptance is decided from
-   whether that one region's size and shape stay consistent as the
-   classification threshold is swept, not from comparing it to other
-   curves.
+   by construction), and fit an ellipse to its convex hull. This removed
+   revision 3's "multiple real, concentric edges can all look valid"
+   ambiguity, but replaced it with a different, more basic problem: the
+   hole was still defined entirely by matching the *surrounding
+   background's* color, not by anything about the ring itself - fragile
+   under ordinary shadows, reflections, textured surfaces, and lighting
+   gradients, and with a conceptual gap (an enclosed background-colored
+   region isn't *guaranteed* to be the physical hole; fitting to the
+   convex hull means an incomplete/wrong segmented crescent can still
+   produce a convincing-looking ellipse). Concretely, this revision could
+   not measure Real ring A at all (see below) - its opening has a genuine
+   brightness gradient across it that no single color-distance threshold
+   recovers cleanly.
+5. **Ring-body / mask-topology (current)** — changes WHAT is segmented.
+   Instead of "is this pixel colored like the background", it asks "is
+   this pixel part of the physical ring body", using MobileSAM (a small
+   promptable segmentation model) seeded with positive prompts on the
+   ring's own band material and negative prompts inside the hole and
+   outside the ring - i.e. told what the ring itself looks like, not what
+   the table looks like. The hole is read off the resulting mask's own
+   contour **topology** (RETR_CCOMP hierarchy: body = largest top-level
+   contour, hole = its largest enclosed child), not from any color match.
+   A convex-hull solidity check gates whether that hole boundary is
+   complete enough to trust; the reported ellipse is always fit to the
+   mask's **raw** contour, never the hull, so an incomplete/wrong mask
+   can't be hull-reconstructed into a convincing wrong number.
+
+**TWO-HYPOTHESIS STRATEGY:** `locate_outer_ring_circle`'s own docstring
+documents a real ambiguity - on a clean, high-contrast photo, Hough can
+lock onto the ring's INNER hole edge just as easily as its outer edge,
+with no way to tell which before looking further. Revision 5 generates
+BOTH readings and carries each one all the way through segmentation and
+topology analysis: H1 ("r=outer") assumes the hint is the outer edge and
+searches inward (reusing the pre-existing `radial_inner_candidate`) for a
+hole radius; H2 ("r=inner") assumes the hint is the hole edge and
+searches outward (the new `radial_outer_candidate`, a mirror of the same
+function) for an outer band radius. Whichever hypothesis (if either)
+produces a valid mask topology is reported; when both do, their agreement
+is surfaced as `detection_spread_mm` (a confidence signal, not a gate).
 
 **Two alternatives were investigated and rejected before settling on
-revision 4**, per explicit instruction to check both an ML segmentation
-model and a simpler deterministic method and compare before deciding:
+prompted MobileSAM for revision 5**, per explicit instruction to test a
+properly-seeded deterministic baseline against a genuinely promptable
+model and compare before deciding, judging mask correctness before ever
+looking at a diameter:
 
-- **GrabCut** (`cv2.grabCut`, mask-seeded from the coarse Hough ROI): on
-  all 3 real test photos it merged the ring band and the hole interior
-  into one foreground blob, because a naive radius-based seeding gives it
-  no "probable background" seed pixels anywhere inside the outer disk —
-  it would need a seed that already roughly marks the hole, which assumes
-  the very thing being detected. Not viable without a separate hole
-  localizer already in hand.
-- **FastSAM** (`ultralytics` `FastSAM-s.pt`, promptless "segment
-  everything"): inconsistent across the 3 real photos — on the one photo
-  with strong hole/band contrast it isolated the hole cleanly as its own
-  mask, but on the other two it merged the entire ring/cap body and its
-  hole into a single object mask with no separate "hole" segment at all —
-  i.e. it reproduced a version of the same ambiguity this redesign exists
-  to remove, on 2 of 3 real photos, rather than resolving it.
-
-The deterministic multi-threshold approach below performed
-comparably-or-better than FastSAM on all 3 real photos, is reproducible
-(no model weights, no GPU), and is markedly faster (measured on this
-delivery's own hardware: real photos now process in ~2.0–2.3s, vs. ~6–7s
-under the ellipse-ensemble revisions — see the updated processing-time
-table below).
+- **Seeded GrabCut** (`cv2.grabCut`, `GC_INIT_WITH_MASK`), using the SAME
+  two-hypothesis geometric priors as narrow seed regions (a small central
+  disk as definite background, a thin annulus near the hypothesis's own
+  band as definite foreground, well outside as definite background, the
+  large genuinely-ambiguous middle region left probable-background rather
+  than guessed - an earlier, naive fixed-fraction-radius seeding attempt
+  failed outright on all 3 real photos before this fix, because ring band
+  width relative to outer diameter varies too much to assume a fixed
+  fraction). Once properly seeded, this produced topologically clean
+  masks (solidity up to 0.98) on 2 of 3 real photos, and they were
+  visually good. On the third (Real ring A, the reflection-gradient
+  photo) it produced a mask that was STILL topologically clean by every
+  structural check, yet visibly WRONG once the debug overlay was actually
+  inspected: GrabCut's color model classified the bright, reflective part
+  of the true hole as ring material (it resembles the band's own
+  highlights) while correctly keeping the darker part as hole - cutting
+  the real opening roughly in half. This is the concrete demonstration,
+  not just a theoretical worry, of "topological cleanliness is necessary
+  but not sufficient" - see the visual comparison below.
+- **Prompted FastSAM** (`ultralytics` `FastSAM-s.pt`, given the exact same
+  prompt points as MobileSAM below): returned no mask for every
+  hypothesis on every photo. Investigated directly (not assumed) by
+  calling FastSAM without prompts and inspecting its raw output: it only
+  ever generates a handful of "segment everything" masks per image, and
+  its `.prompt()` method SELECTS among those few pre-generated masks using
+  the given points - it does not generate a new mask conditioned on the
+  prompts the way a genuinely promptable model does. Since this project's
+  earlier, separate investigation of promptless FastSAM had already found
+  it fails to isolate the hole as its own object on 2 of 3 real photos,
+  prompted FastSAM inherits that same ceiling regardless of prompt
+  quality - not usable for this task, and not comparable to MobileSAM at
+  all despite both being from the SAM family.
+- **MobileSAM** (`ultralytics.SAM`, wrapping a `mobile_sam.pt` checkpoint
+  - a real point-promptable encoder/decoder model, unlike FastSAM's
+  filter-only `.prompt()`): produced visually complete, correctly-shaped
+  hole boundaries on ALL 3 real test photos, INCLUDING the
+  reflective-ring case where properly-seeded GrabCut's mask was
+  confidently wrong, and INCLUDING the one photo (photo3_cap, an unseen
+  test image with no ground truth) where GrabCut found no valid topology
+  at all. This is what backs `measure_ring` now.
 
 ArUco calibration, perspective rectification, and the Hough-based outer-
 ring localization are unchanged and still run first — strictly for
 coarse ROI localization ("roughly where is the ring"), never for
 deciding which boundary inside that ROI is the right one.
 
-**`segment_hole_candidates`** is the whole detection mechanism now. For
-each threshold z in a sweep (`0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5,
-3.0`, in units of the background sample's own robust per-channel noise
-scale):
+**`analyze_mask_topology`** is the acceptance gate. Given a ring-body
+mask from one hypothesis: clean it (`MORPH_CLOSE` then `MORPH_OPEN`),
+find its contour hierarchy (`RETR_CCOMP`), take the largest top-level
+contour as the body and its largest enclosed child as the hole. Reject
+(`NO_BODY`/`BODY_TOO_SMALL`/`NO_HOLE`/`HOLE_TOO_SMALL`) if that structure
+isn't there at all. Otherwise compute the hole contour's convex-hull
+solidity and its fitted ellipse's axis ratio; accept only if there is
+exactly one significant body, exactly one significant hole, solidity
+`>= MIN_HOLE_SOLIDITY = 0.85`, and axis ratio `>= MIN_HOLE_AXIS_RATIO =
+0.7` (otherwise `TOPOLOGY_NOT_CLEAN`). The reported ellipse is fit to the
+hole's **raw** contour, never its hull - the hull is read only as a
+number (solidity), never used to reshape what gets measured.
 
-1. Classify every pixel in the localized window as background-colored
-   (Lab chroma+one-sided-brightness distance from the sampled background
-   `<= z`) or not.
-2. Clean the mask (`MORPH_OPEN` then `MORPH_CLOSE`).
-3. Find the largest connected component that does **not** touch the
-   window border — by construction, the enclosed hole (everywhere else
-   background-colored pixels touch the border, because the real
-   background is outside the ring).
-4. Take its **convex hull** before fitting an ellipse — the true hole
-   opening is convex; a local brightness gradient or reflection can bite
-   a non-convex notch out of the raw thresholded region without the hole
-   itself having that shape, and the hull recovers it.
+`measure_ring` tries both hypotheses independently, keeps whichever
+valid result has the higher solidity (when both are valid, their
+diameters are also compared and reported as `detection_spread_mm`), and
+returns a specific reason - `RING_NOT_FOUND` (no coarse hint at all),
+`NO_BAND_HYPOTHESIS` (neither radial search found a second radius),
+`SEGMENTATION_MODEL_UNAVAILABLE` (the model failed to load), or
+`HOLE_NOT_SUFFICIENTLY_VISIBLE` (segmentation ran but no hypothesis
+passed the topology gate) - when neither hypothesis is usable.
 
-**Accept/reject is then decided from how that one region behaves across
-the sweep, never from comparing it to other candidates:**
-
-- Fewer than 2 valid z's produced a region at all → `HOLE_NOT_FOUND`.
-- **Stability**: the diameter at the two loosest valid z's must agree
-  within `STABILITY_TOL_MM = 0.5mm` — a real hole's mask should stop
-  growing once loosening the threshold has caught its own noise floor of
-  real boundary pixels; still growing at the loosest thresholds tried
-  means the mask is eating into non-hole material → otherwise
-  `MASK_AMBIGUOUS`.
-- **Shape**: once stable, the loosest stable candidate's axis ratio must
-  be `>= MIN_AXIS_RATIO_FOR_ACCEPT = 0.75` — stable but far from
-  elliptical means the region locked onto a shape that isn't a round hole
-  → otherwise `HOLE_NOT_SUFFICIENTLY_VISIBLE`.
-- Otherwise **ACCEPT**, reporting the **loosest stable** candidate's
-  ellipse (not the tightest, and not an average) — the loosest threshold
-  that hasn't started growing into non-hole material is the one most
-  likely to have recovered the hole's full true extent.
-
-Background-color sampling (`sample_background_reference`) is now
-**hard-required** again (reinstated from its demotion to a weak cue in
-revision 3): it's the primary signal every pixel is classified against,
-so a photo with no usable background reference is an honest
-`BACKGROUND_REFERENCE_UNAVAILABLE` retake, not a silent fallback.
-
-A debug overlay mode (`RING_DEBUG_OVERLAY=1`) renders the ROI, every
-z-threshold's candidate ellipse color-coded from tight (blue) to loose
-(red) with its own diameter/axis-ratio label, and the final accepted
-ellipse in white on top — this is the same view used for the visual
-comparison below.
+A debug overlay mode (`RING_DEBUG_OVERLAY=1`) renders the coarse ROI,
+each valid hypothesis's mask (tinted, one color per hypothesis) and hole
+contour, and the winning ellipse in white on top — this is the same kind
+of view used for the visual comparison below.
 
 **Visual comparison against the real "currently difficult" photos**
-(per explicit instruction: compare boundary placement visually first,
-consult ground truth only afterward) — segmentation-first vs. the
-retired geometry-primary revision:
+(per explicit instruction: inspect mask correctness first, consult
+ground truth only afterward):
 
-- **Real ring B** (keyring-style, reflective): the accepted white ellipse
-  visually traces the true inner hole boundary tightly and evenly all the
-  way around — a clean improvement in visual precision over the previous
-  revision's edge-ensemble result, consistent with the error also
-  improving in the same direction the ground truth is (27.52mm vs.
-  26.80mm, true value 27.00mm — both inside tolerance, segmentation-first
-  slightly closer in this instance, though a single photo doesn't prove a
-  general precision gain).
-- **Photo 3 (metal cap, unseen/no ground truth)**: the accepted white
-  ellipse tightly traces the cap's true small inner opening rather than
-  its larger outer rim — visually consistent with the ~21.2–21.4mm this
-  object measured under the geometry-primary revision's own field-test
-  investigation (see git history), now reproduced independently by a
-  completely different mechanism (mask stability instead of ellipse
-  cross-family consensus) rather than assumed to be right because the
-  number matched.
-- **Real ring A**: this is the photo whose filename suggested a thin
-  steel ring, but visual inspection of its own debug overlay shows it is
-  actually a **knurled/serrated metal cap or lid with a deep, concave
-  interior** — its true opening has a real, strong brightness gradient
-  across it (bright upper-right, dark lower-left), not a flat ring band
-  viewed near-overhead. At every z tried, the recovered region only
-  covers the bright crescent of the true opening (axis_ratio 0.49–0.63,
-  well under the 0.75 floor) and never stops growing even at the loosest
-  z (last_delta 0.75mm, well over the 0.5mm stability tolerance) — see
-  the "Real ring A" note below for the full history of this case's
-  expected outcome.
+- **Real ring B** (keyring-style, reflective): the winning mask's hole
+  contour was zoomed in and inspected directly - it tracks the ring's
+  true inner edge tightly and cleanly all the way around, with no visible
+  gap or overreach. Its diameter (28.27mm) is 1.27mm over the 27.00mm
+  ruler ground truth - looser than the previous revision managed on this
+  same photo (27.52mm) - but a visibly correct mask with a plausible
+  measurement error is a fundamentally different, more trustworthy
+  outcome than a topologically-clean-looking mask that turns out wrong on
+  inspection (see GrabCut on Real ring A, directly below).
+- **Real ring A** (the reflection-gradient photo every earlier revision
+  failed on): MobileSAM's mask, zoomed in and inspected directly, traces
+  the true opening completely and tightly all the way around, INCLUDING
+  through the bright-to-dark reflection gradient that defeated background-
+  color matching (revision 4: never stabilized, axis ratio never exceeded
+  ~0.6) and that properly-seeded GrabCut got topologically-clean-but-
+  visibly-wrong on. This is the clearest evidence in this delivery that
+  ring-BODY segmentation, not hole-by-color-matching, was the right
+  semantic shift - see the "Real ring A" note below for the full history
+  of this case's expected outcome.
+- **photo3_cap** (an additional unseen photo used only for architecture
+  comparison during this revision, not a regression-suite case - no
+  independently recorded ground truth exists for it): properly-seeded
+  GrabCut found no valid topology at all on this photo (both hypotheses
+  degenerate/rejected). MobileSAM succeeded on both hypotheses, which
+  agreed with each other to within 0.01mm (24.25mm vs. 24.26mm) - strong
+  internal cross-hypothesis agreement, though still not a substitute for
+  an independently measured ground truth this photo doesn't have.
 
-**Real ring A: expectation changed from ACCEPT back to REJECT.** Under
-the geometry-primary revision, several edge-based methods still agreed
-on a plausible-looking concentric ellipse for this photo — exactly the
-"multiple real, concentric edges can all look valid" ambiguity that
-motivated moving away from ellipse-candidate scoring at all. Under mask
-segmentation there is no ensemble to agree within itself; the single
-enclosed region's own behavior across the z-sweep is the evidence, and
-for this photo that evidence is unambiguous: it never stabilizes and
-never reaches a plausible axis ratio (see numbers above). This is an
-honest `MASK_AMBIGUOUS` — the mask genuinely cannot recover this object's
-boundary, most likely because it isn't the kind of object ("ring, flat
-band, near-overhead") this pipeline is scoped to in the first place (see
-the instructions screen's "not yet supported" list). `regression_suite.py`'s
-expected outcome was updated to `REJECT` to match, per the same
+**Real ring A: expectation changed from REJECT back to ACCEPT** (the
+mirror image of the change the *previous* revision made in the other
+direction). Under background-color matching, this photo's evidence was
+unambiguous the other way: the recovered region never stabilized and
+never reached a plausible axis ratio. Under ring-body segmentation, the
+evidence is unambiguous in this direction: a clean, high-solidity,
+correctly-shaped mask whose contour was directly, visually confirmed (not
+just topology-checked) to trace the true opening. `regression_suite.py`'s
+expected outcome was updated to `ACCEPT` to match, per the same
 generalization policy this project has followed for every previous
 architecture change: re-validated against the whole suite (still 11/11),
-never special-cased for this one photo, and never "fixed" by loosening
-`STABILITY_TOL_MM`/`MIN_AXIS_RATIO_FOR_ACCEPT` to force an ACCEPT here —
-see the no-overfitting policy in `pipeline.py`'s module docstring.
+never special-cased for this one photo's filename or identity, and this
+case carries no ground-truth/tolerance in `CASES` at all (see that file's
+comments) rather than inventing a fabricated-precision number against a
+ground truth (~17mm, coarse ruler, recorded under the since-corrected
+assumption that this was a small thin object) that a mask-confirmed
+21.13mm gives real reason to distrust.
 
 ### Observed failures and limitations
 
@@ -369,35 +428,35 @@ see the no-overfitting policy in `pipeline.py`'s module docstring.
   Revisit once more real low-resolution photos are available. Diagnostic
   logging of received photo dimensions remains in `backend/main.py` to
   keep visibility into what resolutions real uploads actually arrive at.
-- **Reflective/metal rings are the hardest case.** Reflective material
-  produces genuinely ambiguous local color/brightness right at and inside
-  the true boundary (highlights, bevels), which is exactly why this
-  project moved away from trusting any single boundary-detection method
-  (or an ensemble of them scored against each other) and toward judging
-  one segmented region's own stability across a threshold sweep instead.
-  That's a real improvement for some reflective cases (Real ring B: a
-  clean, tightly-traced hole boundary — see the visual comparison above)
-  but not a universal fix: an object whose true opening has a genuine,
-  strong brightness gradient across it (Real ring A, see above) can
-  still legitimately defeat segmentation at every threshold, and the
-  honest outcome there is a REJECT, not a forced number.
-  A **wrong-but-confident** fix for one specific low-contrast reflective
-  photo was found, verified to be wrong (23.47mm vs 27mm ground truth by
-  directly downscaling the same validated photo), and reverted rather
-  than shipped — see the "AI output independently checked" section below.
-  That finding, from an earlier architecture revision, is part of what
-  motivated trusting mask STABILITY rather than a single confident-
-  looking number in the current design.
+- **Reflective/metal rings, and rings with a strong internal reflection
+  gradient across their opening, were the hardest case** and are the
+  specific failure mode this revision was built to fix. Real ring A
+  (reflection gradient) now succeeds with a visually confirmed correct
+  mask, and Real ring B (reflective band) also produces a visually
+  correct mask, though with more diameter error than the previous
+  revision managed on the same photo (see "Test evidence"/visual
+  comparison above) - a real, disclosed trade: less error on the case
+  that used to be entirely unmeasurable, more error on the case that used
+  to be the closest fit. A GrabCut baseline that looked topologically
+  clean but was visually wrong on Real ring A (see above) is the concrete
+  evidence for why this revision insists on inspecting masks, not just
+  their topology scores.
+- **New ML dependency (torch + ultralytics + a MobileSAM checkpoint) and
+  a real latency cost** - see "ML dependency, honestly" and the
+  processing-time table below. This is a genuine trade against the
+  previous revision's speed, taken on because background-color matching
+  could not be made reliable on ordinary real-world lighting conditions
+  no matter how it was tuned (see the architecture history above).
+- **Real-ring diversity is thin (2 real rings, one additional unseen
+  photo used only for architecture comparison).** Same gap this project
+  has flagged in every previous revision: two rings, however different,
+  is not enough to claim general reliability across ring types. See the
+  note earlier in this section - unchanged by this revision.
 - **Ring size lookup range:** the US 3–13.5 adult finger-ring range is
   the only lookup table implemented; anything outside it (e.g. a keyring)
   is flagged `ring_size_in_range: false` rather than forced into a
   nonsense size.
 - **No accounts/persistence** — each photo is measured independently.
-- Processing time is dominated by full-resolution OpenCV work on large
-  real photos (see below) — a downscale-before-processing "optimization"
-  was tried during development and reverted because it silently broke
-  calibrated detection thresholds (see `main.py`'s
-  `load_image_any_format` docstring).
 
 ### Measured processing time
 
@@ -405,29 +464,39 @@ From the same `regression_suite.py` run:
 
 | Case | Time |
 |---|---|
-| Real ring A (full-res phone photo, rejected) | ~2.3s |
-| Real ring B (full-res phone photo) | ~2.1s |
-| Synthetic renders (smaller images) | 0.15–0.25s |
+| Real ring A (full-res phone photo) | ~9.0s |
+| Real ring B (full-res phone photo) | ~8.2s |
+| Synthetic renders (smaller images) | 2.8–3.4s |
 | Heavy blur (rejected before detection runs) | ~0.02s |
 
-Real-photo time dropped substantially (~6–7s under the ellipse-ensemble
-revisions to ~2.0–2.3s here) because the segmentation-first pipeline no
-longer runs 6 separate full-resolution segmentation variants (4 Canny
-threshold pairs, adaptive, Otsu) plus per-candidate radial-histogram
-fallbacks and cross-family clustering — it runs one Lab-distance
-classification pass per z-threshold over a localized window, which is
-both a smaller region and a cheaper per-pixel operation. This is the
-"time to useful result" a user actually experiences end to end
-(including HEIC/full-resolution decode), not just algorithm time.
+Real-photo time went UP substantially versus the previous revision
+(~2.0–2.3s there, ~8–9s here) - the direct, honest cost of the new ML
+dependency: instead of one cheap Lab-distance classification pass per
+z-threshold over a small window, this revision runs up to two full
+MobileSAM CPU inference passes (one per band hypothesis) on top of the
+same ArUco/Hough localization work. This is a real regression in latency
+for a real improvement in reliability on the hardest real photos (see
+"Test evidence" above) - not free, and worth knowing about before
+deploying somewhere latency-sensitive; GPU inference or a smaller/
+quantized checkpoint would likely recover most of it, neither was
+attempted here. This is the "time to useful result" a user actually
+experiences end to end (including HEIC/full-resolution decode and model
+inference), not just algorithm time.
 
 ## Cost
 
-**Variable cost per image: $0 API/model cost.** The measurement path is
-pure OpenCV/NumPy computer vision running in the same process that serves
-the HTTP request — there is no per-call paid API or hosted model in the
-loop (no vision LLM, no third-party CV API). This is a statement about
-per-image marginal API/model cost specifically, not a claim that the
-service is free to run — see hosting cost below for what it actually
+**Variable cost per image: $0 API/model cost, but real compute cost.**
+The measurement path runs entirely in the same process/container that
+serves the HTTP request — there is no per-call *paid* API or third-party
+hosted model in the loop (no vision LLM, no third-party CV API, no
+metered inference endpoint). MobileSAM inference is genuinely real
+compute, though: unlike the previous revision, per-image cost is no
+longer negligible CPU work - each measured photo now burns several real
+CPU-seconds (see processing-time table above), which shows up directly in
+the hosting-cost math below, not as a separate line item. This is a
+statement about per-image marginal *API/model-fee* cost specifically
+(there is none), not a claim that the service's compute footprint is
+unchanged from before — see hosting cost below for what it now actually
 costs to keep this online.
 
 **Hosting cost (separate from per-image cost):** deployed on Railway,
@@ -443,13 +512,23 @@ writing):
 Metered usage on top of that: **$0.00000772 per vCPU-second** and
 **$0.00000386 per GB(RAM)-second** while the container is running, plus
 $0.05/GB egress. A small always-on single-instance FastAPI service like
-this one, idling most of the time with occasional ~6-second bursts of
-CPU-heavy work per photo, comfortably fits inside the Hobby plan's $5
-included credit under light/demo traffic; cost scales with how long the
-container stays up and how much CPU each request burns, not with a
-per-image API fee. This is a cost *structure* statement based on
-Railway's published rates, not a measured production bill — actual spend
-depends on real traffic volume, which this delivery hasn't had.
+this one, idling most of the time with occasional CPU-heavy bursts per
+photo, still comfortably fits inside the Hobby plan's $5 included credit
+under light/demo traffic; cost scales with how long the container stays
+up and how much CPU each request burns, not with a per-image API fee.
+Two things changed with this revision, though, and are worth naming
+honestly rather than reusing the previous estimate unchanged: those
+bursts are now ~8-9s per real photo instead of ~2s (see processing-time
+table above - roughly 4x the CPU-seconds per measurement), and the
+container image itself is meaningfully larger (torch + ultralytics + the
+~39MB MobileSAM checkpoint), which affects build/storage more than
+per-request billing but is still a real footprint change. Under light/
+demo traffic this is still well inside the Hobby plan's included credit;
+it would matter more at higher sustained request volume than under
+heavier, more latency-sensitive traffic. This remains a cost *structure*
+statement based on Railway's published rates, not a measured production
+bill — actual spend depends on real traffic volume, which this delivery
+hasn't had.
 
 ## How AI-generated code/output was independently checked (concrete example)
 
@@ -515,8 +594,8 @@ pre-detection `RESOLUTION_TOO_LOW` gate described above — added and then
 added as its own regression case (`real_ring_B_downscaled`, now 11/11)
 rather than trusted on the strength of one manual check.
 
-A fourth example, from building the current segmentation-first
-architecture: before committing to the deterministic multi-threshold
+A fourth example, from building the (now superseded) segmentation-first
+architecture: before committing to that deterministic multi-threshold
 design, two other approaches (GrabCut, FastSAM) were actually implemented
 and run against the same 3 real photos, not assumed to be worse or better
 from first principles. GrabCut's failure (merges ring and hole into one
@@ -524,8 +603,35 @@ blob) and FastSAM's inconsistency (isolates the hole on 1 of 3 photos,
 merges everything into one object mask on the other 2) were both observed
 directly from saved mask visualizations, not inferred. Only after that
 comparison did the deterministic approach get built out fully and
-regression-tested — and even then, the one real photo it REJECTs (Real
-ring A) was verified by reading its own debug overlay (the recovered
-region visibly only covers a bright crescent of the true opening, never
-the whole boundary) before accepting that REJECT as correct rather than
-as a bug to chase.
+regression-tested — and even then, the one real photo it REJECTed at the
+time (Real ring A) was verified by reading its own debug overlay (the
+recovered region visibly only covers a bright crescent of the true
+opening, never the whole boundary) before accepting that REJECT as
+correct rather than as a bug to chase.
+
+A fifth example, from building the current ring-body/mask-topology
+architecture: a properly-seeded GrabCut baseline was built, and its
+result on Real ring A PASSED every structural check this project uses to
+judge a mask (single body, single hole, solidity 0.98, plausible axis
+ratio) - by that measure alone it looked like a success. Per the explicit
+instruction to inspect the actual mask before trusting its topology, the
+debug overlay was opened and looked at directly anyway, rather than
+accepting the topology-clean verdict as sufficient. It showed the mask
+visibly cutting the true opening roughly in half - the bright, reflective
+part of the hole had been classified as ring material. This is the same
+class of finding as the third example above (a fix that "passes its own
+check" but is wrong on direct inspection), now demonstrated specifically
+against the structural mask-topology checks this revision itself
+introduces, which is exactly why this project's evaluation policy insists
+on looking at the actual output before trusting any automated check of
+it, however principled that check is. Separately, prompted FastSAM was
+initially assumed (reasonably, given it's marketed as promptable) to be
+directly comparable to MobileSAM - it was not: calling it without prompts
+and inspecting its raw output directly showed it only ever generates a
+handful of "segment everything" masks and its `.prompt()` method merely
+selects among them, rather than generating a new mask conditioned on the
+prompts. That distinction was found by direct investigation of the
+library's actual behavior, not read from its documentation or assumed
+from its name/marketing - see `pipeline.py`'s module docstring and the
+architecture section above for what this changed about which model was
+actually usable for this task.

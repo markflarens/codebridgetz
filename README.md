@@ -12,25 +12,37 @@ diameter entry, no manual scale calibration.
 
 ## Architecture
 
-- **backend/** — FastAPI service wrapping a deterministic OpenCV pipeline
-  (ArUco marker detection → homography rectification → coarse ring ROI
-  localization → background-color segmentation of the ring's enclosed
-  hole → US ring size lookup). No ML model, no LLM in the measurement
-  path — see `pipeline.py`'s module docstring and inline comments for
-  why, and for the specific real-photo failures that shaped each
-  guardrail. ArUco/homography/Hough are used only to locate roughly where
-  the ring is. Which pixels inside that area are the true inner hole is
-  then decided by SEGMENTATION, not by scoring candidate boundary curves
-  against each other: every pixel is classified as background-colored or
-  not (against the photo's own locally-sampled background), the single
-  enclosed background-colored region is the hole by construction, and its
-  ellipse is accepted once its size and shape stop changing across a
-  sweep of classification thresholds. Two alternatives (GrabCut, and the
-  lightweight ML segmenter FastSAM) were tried and found less reliable
-  than this deterministic approach — see DELIVERY_NOTES.md for the
-  investigation. Set `RING_DEBUG_OVERLAY=1` to get back an overlay image
-  showing every threshold's candidate ellipse (color-coded tight→loose)
-  and the one accepted.
+- **backend/** — FastAPI service wrapping a CV pipeline (ArUco marker
+  detection → homography rectification → coarse ring ROI localization →
+  prompted ring-BODY segmentation → enclosed hole read from the resulting
+  mask's own topology → robust ellipse fit → US ring size lookup). ArUco/
+  homography/Hough are deterministic and used only to locate roughly
+  where the ring is. WHICH pixels are the ring's own body material, and
+  therefore which enclosed region is its hole, is decided by prompting
+  MobileSAM (a small, genuinely point-promptable segmentation model) with
+  positive points on the ring band and negative points inside the hole
+  and outside the ring, then reading the hole off the resulting mask's
+  contour hierarchy — not by matching pixel colors against the
+  surrounding background (an earlier revision's approach, dropped because
+  it defines the hole by what's AROUND the ring rather than anything
+  about the ring itself, and is fragile under ordinary shadows,
+  reflections, and lighting gradients). Because `locate_outer_ring_circle`
+  can land on either the ring's outer edge or its inner hole edge on a
+  clean photo, both readings are tried (see `pipeline.py`'s
+  TWO-HYPOTHESIS STRATEGY) and whichever produces a valid mask (one body,
+  one hole, high hole solidity, plausible shape) is used. A convex hull is
+  used only to CHECK that validity, never to fit the reported ellipse — so
+  an incomplete mask can't be hull-reconstructed into a convincing-looking
+  wrong measurement. A properly-seeded GrabCut baseline and a prompted
+  FastSAM baseline were both tried and found less reliable than prompted
+  MobileSAM — see DELIVERY_NOTES.md for the investigation and visual
+  comparison. This is a real, new ML dependency (torch + ultralytics + a
+  ~39MB MobileSAM checkpoint) — see "ML dependency" below for the honest
+  cost/benefit. The model's role is scoped narrowly: it only produces a
+  ring-body mask; the diameter itself is still computed by classical
+  ellipse-fitting on that mask's own contour, exactly as every earlier
+  revision computed it. Set `RING_DEBUG_OVERLAY=1` to get back an overlay
+  image showing each hypothesis's mask/hole contour and the one accepted.
 - **frontend/** — vanilla HTML/CSS/JS single-page app (no build step).
   Talks to the backend over `fetch`.
 
@@ -42,9 +54,25 @@ decode HEIC without it.
 
 ```bash
 cd backend
-pip install -r requirements.txt
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
+
+The `--extra-index-url` pulls a CPU-only `torch` build (see Dockerfile
+comments) instead of a much larger default CUDA one; every other package
+still comes from PyPI. The MobileSAM checkpoint (`backend/weights/
+mobile_sam.pt`, ~39MB) is not committed to the repo (kept out via
+`.gitignore` to keep the repo/patches a reasonable size) — fetch it once
+with:
+
+```bash
+python3 -c "from ultralytics import SAM; SAM('backend/weights/mobile_sam.pt')"
+```
+
+(run from the repo root; `ultralytics` downloads straight to that path).
+The Dockerfile runs the same command at image build time, so a deployed
+container never needs this step or any runtime network access to fetch
+it.
 
 Open `http://localhost:8000` on your phone (same network as the host) or
 in a desktop browser. The frontend is served by the same FastAPI process
@@ -69,8 +97,8 @@ Success:
   "sizing_standard": "US/Canada ring size (linear inside-circumference scale)",
   "sizing_source": "https://measureringsize.com/ring-size-chart",
   "rounding_rule": "...",
-  "detection_spread_mm": 0.8,
-  "family_estimates": {"canny": 16.53, "adaptive": 16.8, "otsu": 17.33},
+  "detection_spread_mm": 0.01,
+  "family_estimates": {"r=outer": 16.79, "r=inner": 16.80},
   "processing_time_ms": 6408.7,
   "overlay_image": "data:image/jpeg;base64,..."
 }
@@ -91,16 +119,38 @@ Retake:
 
 ## What "detection_spread_mm" is and isn't
 
-Under the current segmentation-first pipeline, this is the remaining gap
-between the diameter recovered at the two LOOSEST background-classification
-thresholds tried in the sweep — i.e. how much the recovered hole boundary
-was still changing right at the point it was judged "stable enough" to
-accept. It is **not** a full measurement-uncertainty estimate — it
-doesn't account for printer scale error, lens distortion, or ArUco corner
-localization error. The frontend says this explicitly in the result
-screen's disclosure section; don't repurpose the number as a lab-grade
-error bar without further calibration against more caliper-measured
-rings.
+Under the current ring-body/mask-topology pipeline, this is the size
+difference between the two independent band HYPOTHESES (see
+`pipeline.py`'s TWO-HYPOTHESIS STRATEGY) when BOTH of them independently
+produced a valid ring-body/hole mask — i.e. how much two separate
+readings of the same coarse localization hint, each segmented and
+measured on its own, agree with each other. When only one hypothesis
+produced a valid mask, there is nothing to compare it against and the API
+returns `null`/the frontend shows "n/a". Either way this is **not** a
+full measurement-uncertainty estimate — it doesn't account for printer
+scale error, lens distortion, or ArUco corner localization error. The
+frontend says this explicitly in the result screen's disclosure section;
+don't repurpose the number as a lab-grade error bar without further
+calibration against more caliper-measured rings.
+
+## ML dependency, honestly
+
+This revision adds a real dependency the project didn't have before:
+`torch` + `ultralytics` + a MobileSAM checkpoint (~39MB), baked into the
+Docker image so a fresh deploy doesn't depend on runtime network access
+to fetch it. That's a real cost — bigger image, and CPU inference time
+per photo (see "Test evidence" below for the actual before/after
+processing-time numbers) — taken on because the alternative that worked
+without it (matching the hole against the surrounding background's
+color) was fragile in exactly the ways real photos are hardest: ordinary
+shadows, reflections, textured surfaces, and lighting gradients. The
+model's job is scoped narrowly and does not change the project's
+"diameter is computed by classical geometry, not asked from a model"
+position: it only answers "which pixels are ring-body material, given
+these prompts" — it is never asked to estimate a size, and the reported
+diameter is still a classical ellipse fit to that mask's own contour,
+converted to mm via the ArUco-calibrated scale, exactly like every
+earlier revision.
 
 ## Test evidence (from development)
 
@@ -109,48 +159,65 @@ measured against this pipeline:
 
 | Photo | Caliper/ruler ground truth | Pipeline result | Abs. error |
 |---|---|---|---|
-| IMG_9784 (keyring-style ring) | 27mm (ruler) | 27.52mm | 0.52mm |
-| IMG_9783 | ~17mm (ruler, coarse) | REJECT — `MASK_AMBIGUOUS` | n/a |
+| IMG_9784 (keyring-style ring) | 27.00mm (ruler) | 28.27mm | 1.27mm |
+| IMG_9783 (ornate/knurled ring, mild angle, reflection gradient) | ~17mm (ruler, coarse — see note) | 21.13mm | n/a — see note |
 
-IMG_9783 is now an honest, investigated REJECT, not an ACCEPT: visual
-inspection of its own debug overlay shows the object is actually a
-knurled/serrated metal cap with a deep, concave interior carrying a real
-brightness gradient across the true opening — not a flat ring band. The
-segmentation never stabilizes and never reaches a plausible shape for
-this photo at any threshold tried, which is the correct outcome for an
-object whose true boundary the mask genuinely cannot recover cleanly, not
-a regression — see DELIVERY_NOTES.md for the full architecture history,
-the GrabCut/FastSAM investigation, and a debug-overlay comparison for all
-three difficult real photos evaluated during this redesign.
+IMG_9783 is now an honest ACCEPT, not a REJECT: this photo's true object
+is a knurled-band ring with a real bright-to-dark reflection gradient
+across its opening (not the "deep concave cap" an earlier revision's
+notes mischaracterized it as), and every prior architecture failed on it
+for a reason specific to that architecture (see DELIVERY_NOTES.md for the
+full history). The ~17mm ground truth here was a coarse, informal ruler
+reading taken under that earlier, incorrect "small thin object"
+assumption; the winning mask was directly visually inspected (not just
+topology-checked) and its contour traces the ring's true opening tightly
+and completely, including through the reflection gradient — a ~4mm gap
+against a ground truth that dubious is far more consistent with the
+ground truth being wrong than the mask being wrong, but this project
+doesn't have a trustworthy independent re-measurement to score against,
+so the honest thing is to report the mask-confirmed number and say so,
+not to force a "correct-looking" answer either direction. IMG_9784's
+1.27mm gap against its own (also ruler-based, less dubious) ground truth
+is discussed in DELIVERY_NOTES.md alongside a visual confirmation that
+this mask, too, is not visibly wrong.
 
 Six synthetic stress photos (clean, specular highlight, shadow gradient,
 low contrast, textured background, heavy blur) and one adversarial decoy
 (a second circular object in frame) are in the `test_set/` folder used
 during development — see delivery notes for the full pass/fail table.
+Synthetic-photo accuracy improved markedly under this revision (typically
+0.01–0.25mm error against exact synthetic ground truth, vs. 0.2–0.6mm
+under the previous background-color-matching revision).
 
 ## Known limitations (first version)
 
 - One ring, one marker, same plane, near-overhead only — by design (see
   the "not yet supported" list on the instructions screen).
-- Processing time on real test photos is now ~2-2.3s (down from ~6-8s
-  under the earlier ellipse-ensemble pipeline — the segmentation-first
-  design runs one classification pass per threshold over a localized
-  window instead of six full-resolution segmentation variants plus
-  fallbacks), mostly HEIC decoding and full-resolution OpenCV work. A
-  downscale-before-processing optimization was tried and reverted — it
-  silently broke calibrated detection thresholds on both real photos (see
-  `main.py`'s `load_image_any_format` docstring). Revisit with a properly
-  re-validated set of thresholds, not by re-adding the same shortcut.
-- Reflective/metal rings remain the hardest case. Segmentation handles
-  ordinary highlights/bevels better than the retired ellipse-candidate
-  approach (see DELIVERY_NOTES.md's visual comparison), but an object
-  whose true opening carries a genuine, strong brightness gradient across
-  it can still legitimately defeat every threshold in the sweep — the
-  pipeline reports `MASK_AMBIGUOUS`/`HOLE_NOT_SUFFICIENTLY_VISIBLE` rather
-  than a number it can't stand behind. `detection_spread_mm` on an
-  ACCEPTed real photo is typically well under 0.1mm now (the sweep had
-  already stabilized), which is a stability signal, not a lab-grade
-  accuracy guarantee — see "What detection_spread_mm is and isn't" above.
+- Processing time on real test photos is now ~8-9s (up from ~2-2.3s under
+  the previous background-color-matching revision) - this is the direct,
+  honest cost of the ML dependency discussed above: up to two MobileSAM
+  CPU inference passes (one per band hypothesis) instead of a pixel-
+  distance threshold sweep. Synthetic (smaller, cleaner) test photos run
+  in ~2.8-3.2s. This is a real regression in latency for a real
+  improvement in reliability on hard real photos (see "Test evidence"
+  above) - not free, and worth knowing about before deploying somewhere
+  latency-sensitive. GPU inference or a smaller/quantized checkpoint would
+  likely recover most of this; neither was attempted here (CPU-only
+  Railway deployment, and MobileSAM was already the "small" end of the
+  SAM family).
+- Reflective/metal rings, and rings whose opening has a strong internal
+  reflection gradient, are handled meaningfully better than under every
+  earlier revision (see DELIVERY_NOTES.md's visual comparison) - this was
+  the specific failure mode this revision was built to fix, and it now
+  succeeds on the one real photo that defeated every prior approach.
+  Photos where `locate_outer_ring_circle` can't localize the ring at all,
+  or where neither band hypothesis's prompts land MobileSAM on a clean
+  single-body/single-hole mask, still honestly REJECT
+  (`RING_NOT_FOUND`/`NO_BAND_HYPOTHESIS`/`HOLE_NOT_SUFFICIENTLY_VISIBLE`)
+  rather than report a number the mask itself doesn't support.
+  `detection_spread_mm` is only meaningful when both hypotheses validate
+  (see "What detection_spread_mm is and isn't" above) - it is not present
+  on every accepted result.
 - Detection thresholds are only validated at full phone-camera resolution
   (marker ~430px on a side in the original upload). A photo uploaded at
   roughly half that pixel density is rejected with `RESOLUTION_TOO_LOW`

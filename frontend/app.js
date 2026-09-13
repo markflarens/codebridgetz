@@ -147,10 +147,16 @@
     const flag = document.getElementById("reading-size-flag");
     flag.textContent = data.ring_size_in_range ? "" : "outside standard US finger-ring range";
 
-    // No "±" here on purpose: this number is cross-METHOD disagreement
+    // No "±" here on purpose: this number is cross-HYPOTHESIS agreement
     // (see the disclosure below it), not a physical measurement
-    // uncertainty/error bar - the ± symbol implies the latter.
-    document.getElementById("data-spread").textContent = `Spread: ${data.detection_spread_mm.toFixed(2)} mm`;
+    // uncertainty/error bar - the ± symbol implies the latter. It is only
+    // present when BOTH hypotheses (see pipeline.py) independently
+    // produced a valid mask; when only one did, there is nothing to
+    // compare it against.
+    const spreadEl = document.getElementById("data-spread");
+    spreadEl.textContent = (data.detection_spread_mm === null || data.detection_spread_mm === undefined)
+      ? "Spread: n/a (single hypothesis)"
+      : `Spread: ${data.detection_spread_mm.toFixed(2)} mm`;
 
     const familyEstimates = data.family_estimates || {};
     const methods = Object.keys(familyEstimates);
