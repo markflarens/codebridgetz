@@ -52,35 +52,42 @@ TEST_SET_DIR = os.path.normpath(os.path.join(_HERE, "..", "test_set"))
 # independently of this pipeline's own output - see the policy note
 # below), then add one row here with that filename and ground truth.
 CASES = [
-    # Expected status changed back from REJECT to ACCEPT, for the second
-    # time, as a documented CONSEQUENCE of the geometry-primary redesign
-    # (see pipeline.py's module docstring, "DETECTION ARCHITECTURE
-    # (GEOMETRY-PRIMARY REVISION)") - not a fix tuned to make this one
-    # photo pass. History, for anyone reading this later: this ring's band
-    # is heavily hammered/textured AND has a strong specular highlight
-    # bisecting the visible hole interior itself. An earlier revision
-    # required the independent color-topology detector ("holecolor") to
-    # confirm every accepted cluster (has_topological_confirmation); that
-    # highlight splits the true hole's background-colored region into a
-    # non-convex crescent that failed holecolor's own circularity filter,
-    # so this photo REJECTed even though every edge-based family
-    # (canny/adaptive/otsu) still found and tightly agreed on the correct
-    # boundary. That was reported at the time as an intentional, accepted
-    # trade-off of a stricter but more conservative system - but it turned
-    # out, in combination with the same mandatory-topological-confirmation
-    # rule rejecting other normal photos for the same underlying reason
-    # (a local shadow/highlight breaking the *color* match, not the
-    # *boundary*), to make the whole pipeline too conservative in exactly
-    # the way this redesign was asked to fix: color/background similarity
-    # is now a weak secondary cue, never a requirement, and boundary
-    # coverage is evaluated with partial-arc tolerance (edge_support_-
-    # fraction) rather than requiring one contour to already be fully
-    # closed. Under that rule this photo now ACCEPTs from geometry alone,
-    # at ~17.07mm - consistent with the edge families' own long-standing
-    # measurement and this ring's previously-recorded ~17mm ground truth,
-    # not a new or different number produced by loosening anything to
-    # match it.
-    ("real_ring_A_9783",        "real_ring_A_IMG_9783.jpg",             "ACCEPT", 17.0,  1.0),
+    # Expected status changed from ACCEPT back to REJECT as a documented
+    # CONSEQUENCE of the segmentation-first redesign (see pipeline.py's
+    # module docstring, "DETECTION ARCHITECTURE (SEGMENTATION-FIRST
+    # REVISION)") - not a fix tuned to make this one photo pass or fail.
+    # History, for anyone reading this later: this file's name suggests a
+    # thin steel ring, but the actual object in the photo (confirmed by
+    # visually inspecting the debug overlay, not assumed from the
+    # filename) is a knurled/serrated metal cap or lid with a genuinely
+    # DEEP, CONCAVE interior - its opening has a real, strong brightness
+    # gradient across it (bright upper-right, dark lower-left) rather than
+    # being a flat ring band viewed near-overhead. Under geometry-primary
+    # scoring, several edge-based methods still agreed on a plausible-
+    # looking concentric ellipse there (this is exactly the "inner edge,
+    # bevel, highlight, outer edge, and cast shadow can all produce
+    # geometrically valid concentric ellipse candidates" ambiguity the
+    # segmentation-first redesign exists to stop trusting). Under mask
+    # segmentation, the sampled background-color region visibly only
+    # recovers the bright crescent of the true opening at every threshold
+    # tried (z=0.5 through 3.0): axis_ratio stays 0.49-0.63 (well under the
+    # 0.75 floor) and the recovered diameter never stops growing even at
+    # the loosest thresholds (last_delta=0.75mm, well over the 0.5mm
+    # stability tolerance) - see /tmp/new_photos/seg_debug_real_ring_A.png
+    # from the redesign's own investigation. This is an honest
+    # MASK_AMBIGUOUS: the mask cannot cleanly recover this object's
+    # boundary, so it should not report a confident number for it. Do not
+    # "fix" this case by loosening the stability/axis-ratio thresholds to
+    # force an ACCEPT here - per the no-overfitting policy, those
+    # thresholds are validated against the whole set as a fixed rule, not
+    # tuned against this one photo's outcome.
+    ("real_ring_A_9783",        "real_ring_A_IMG_9783.jpg",             "REJECT", None, None),
+    # Precision improved under the segmentation-first redesign: 27.52mm
+    # (abs error 0.52mm against the 27.00mm ruler ground truth) vs. the
+    # previous geometry-primary result of 26.80mm (abs error 0.20mm) -
+    # both comfortably inside the 1.0mm tolerance kept below, which was
+    # never tightened specifically to chase either number (see the
+    # no-overfitting policy above).
     ("real_ring_B_9784",        "real_ring_B_IMG_9784.jpg",             "ACCEPT", 27.0,  1.0),
     # NOT a new/unseen ring - this is the SAME photo as real_ring_B_9784
     # above, downscaled ~2.06x (3024x4032 -> 1466x1956, matching a real

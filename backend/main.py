@@ -49,12 +49,19 @@ RETAKE_MESSAGES = {
     "BLUR": "Photo is too blurry. Hold the phone steady and retake.",
     "UNDEREXPOSED": "Photo is too dark. Move to a brighter area and retake.",
     "OVEREXPOSED": "Photo is too bright or reflective. Use softer, more even light and avoid direct reflections on the ring or marker, then retake.",
-    # BACKGROUND_REFERENCE_UNAVAILABLE removed (geometry-primary redesign):
-    # a missing background sample no longer hard-rejects on its own - see
-    # pipeline.py's module docstring. Measurement now proceeds on geometry
-    # alone in that case, so this reason code can no longer be returned.
+    # BACKGROUND_REFERENCE_UNAVAILABLE reinstated (segmentation-first
+    # redesign): background color is now the primary signal the whole
+    # measurement is built from, not a secondary cue - see pipeline.py's
+    # module docstring. A photo with no usable background sample cannot be
+    # segmented at all, so this is an honest, hard retake reason again.
+    "BACKGROUND_REFERENCE_UNAVAILABLE": "Could not sample a clear background/table color around the ring. Use a plainer, more evenly lit surface, or move the ring away from clutter, and retake.",
     "RING_NOT_FOUND": "Ring edge is unclear. Avoid reflections and place the ring on a contrasting surface.",
-    "RING_EDGE_UNSTABLE": "Ring edge is unclear. Avoid reflections and place the ring on a contrasting surface.",
+    # segmentation-first redesign reason codes - see pipeline.py's
+    # segment_hole_candidates()/measure_ring() for exactly what triggers
+    # each one.
+    "HOLE_NOT_FOUND": "Could not find the ring's inner hole against the background. Make sure the hole is clearly visible and place the ring on a contrasting, evenly lit surface.",
+    "MASK_AMBIGUOUS": "Ring edge is unclear. Avoid reflections and shadows inside the hole, and place the ring on a contrasting, evenly lit surface.",
+    "HOLE_NOT_SUFFICIENTLY_VISIBLE": "The ring's inner hole isn't clearly enough visible to measure reliably. Avoid shadows or reflections across the hole and retake from directly above.",
     "INCONSISTENT_DETECTION": "Detected more than one possible circular object. Make sure only one ring is in the photo, away from other round objects.",
 }
 DEFAULT_RETAKE_MESSAGE = "Could not get a reliable measurement from this photo. Please retake following the instructions."

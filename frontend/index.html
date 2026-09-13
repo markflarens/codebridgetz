@@ -167,8 +167,8 @@
     </div>
 
     <details class="disclosure disclosure--block">
-      <summary>What "cross-method spread" means</summary>
-      <p>Cross-method spread is how much independent detection methods disagreed with each other on the same photo. It is <strong>not</strong> a physical measurement uncertainty (it says nothing about printer scale error, lens distortion, or marker-corner localization error). A low spread means the methods agree; it is a stability signal, not an accuracy guarantee.</p>
+      <summary>What "spread" means</summary>
+      <p>The ring's inner hole is found by segmenting the photo against its own sampled background color at a sweep of thresholds, then checking that the recovered boundary stops changing once the threshold is loose enough. Spread is the remaining size difference between the two loosest thresholds tried. It is <strong>not</strong> a physical measurement uncertainty (it says nothing about printer scale error, lens distortion, or marker-corner localization error). A low spread means the boundary had already stabilized; it is a stability signal, not an accuracy guarantee.</p>
     </details>
 
     <details class="disclosure disclosure--block">
@@ -179,7 +179,7 @@
 
     <details class="disclosure disclosure--block">
       <summary>Measurement details (technical)</summary>
-      <p>Number of independent detection methods that agreed: <span id="data-methods">—</span>.</p>
+      <p>Number of segmentation thresholds that produced a usable boundary: <span id="data-methods">—</span>.</p>
       <p id="data-family-estimates" class="mono-small"></p>
     </details>
   </section>
