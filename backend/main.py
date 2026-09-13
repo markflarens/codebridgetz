@@ -49,7 +49,10 @@ RETAKE_MESSAGES = {
     "BLUR": "Photo is too blurry. Hold the phone steady and retake.",
     "UNDEREXPOSED": "Photo is too dark. Move to a brighter area and retake.",
     "OVEREXPOSED": "Photo is too bright or reflective. Use softer, more even light and avoid direct reflections on the ring or marker, then retake.",
-    "BACKGROUND_REFERENCE_UNAVAILABLE": "Could not reliably sample the table/background around the ring in this photo. Make sure the background is clearly visible around the ring (not filled entirely by the ring, marker, or other objects), then retake.",
+    # BACKGROUND_REFERENCE_UNAVAILABLE removed (geometry-primary redesign):
+    # a missing background sample no longer hard-rejects on its own - see
+    # pipeline.py's module docstring. Measurement now proceeds on geometry
+    # alone in that case, so this reason code can no longer be returned.
     "RING_NOT_FOUND": "Ring edge is unclear. Avoid reflections and place the ring on a contrasting surface.",
     "RING_EDGE_UNSTABLE": "Ring edge is unclear. Avoid reflections and place the ring on a contrasting surface.",
     "INCONSISTENT_DETECTION": "Detected more than one possible circular object. Make sure only one ring is in the photo, away from other round objects.",

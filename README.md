@@ -14,17 +14,23 @@ diameter entry, no manual scale calibration.
 
 - **backend/** — FastAPI service wrapping a deterministic OpenCV pipeline
   (ArUco marker detection → homography rectification → coarse ring ROI
-  localization → inner-hole segmentation, validated against the photo's
-  own background color → US ring size lookup). No ML model, no LLM in
-  the measurement path — see `pipeline.py`'s module docstring and inline
-  comments for why, and for the specific real-photo failures that shaped
-  each guardrail. ArUco/homography/Hough are used only to locate roughly
-  where the ring is; which boundary inside that area is the true inner
-  hole (as opposed to the outer edge, a bevel, a reflection, or a cast
-  shadow) is decided by a material-contrast check against the photo's
-  own sampled background, not by which candidate looks "cleanest" or by
-  how many methods happen to agree on it. Set `RING_DEBUG_OVERLAY=1` to
-  get back an overlay image showing every candidate considered, every
+  localization → geometry-driven inner-hole detection → US ring size
+  lookup). No ML model, no LLM in the measurement path — see
+  `pipeline.py`'s module docstring and inline comments for why, and for
+  the specific real-photo failures that shaped each guardrail.
+  ArUco/homography/Hough are used only to locate roughly where the ring
+  is; which boundary inside that area is the true inner hole (as opposed
+  to the outer edge, a bevel, a reflection, or a cast shadow) is decided
+  primarily by GEOMETRIC evidence — containment/concentricity with the
+  localized ring, how much of the candidate's own perimeter has real edge
+  support somewhere across every segmentation variant (tolerant of a
+  shadow or highlight obscuring a minority arc), fit quality, and
+  agreement between independent detection methods — not by which
+  candidate looks "cleanest" alone. Color/background similarity against
+  the photo's own sampled background is still computed and still
+  contributes one more independent vote, but only as a weak, non-blocking
+  supporting cue, not a requirement. Set `RING_DEBUG_OVERLAY=1` to get
+  back an overlay image showing every candidate considered, every
   rejected candidate with its rejection reason, and the one selected.
 - **frontend/** — vanilla HTML/CSS/JS single-page app (no build step).
   Talks to the backend over `fetch`.
@@ -103,15 +109,17 @@ measured against this pipeline:
 | Photo | Caliper/ruler ground truth | Pipeline result | Abs. error |
 |---|---|---|---|
 | IMG_9784 (keyring-style ring) | 27mm (ruler) | 26.80mm | 0.20mm |
+| IMG_9783 (steel ring, mild angle) | ~17mm (ruler, coarse) | 17.07mm | not precisely scoreable |
 
-IMG_9783 (steel ring, mild angle) now returns a retake
-(`RING_EDGE_UNSTABLE`): its edge-based detectors still measure it
-correctly (~17mm), but its heavily hammered band and a specular highlight
-inside the hole itself prevent the independent topological detector from
-confirming that boundary, and cross-method agreement now requires that
-independent confirmation rather than accepting on edge-based agreement
-alone - see DELIVERY_NOTES.md for the full explanation and a debug-overlay
-comparison.
+Both real photos now ACCEPT. IMG_9783 has a heavily hammered band and a
+specular highlight bisecting the hole interior, which under an earlier
+revision of this pipeline (requiring an independent color-topology
+detector to confirm every boundary) caused a documented, reported REJECT
+even though the edge-based detectors measured it correctly the whole
+time. The current geometry-primary design tolerates a shadow/highlight
+obscuring a minority of the boundary's own perimeter instead of requiring
+full closure or color confirmation — see DELIVERY_NOTES.md for the full
+history and a debug-overlay comparison.
 
 Six synthetic stress photos (clean, specular highlight, shadow gradient,
 low contrast, textured background, heavy blur) and one adversarial decoy

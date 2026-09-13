@@ -132,7 +132,7 @@ Full pass/fail table, from the delivered code, `python3 backend/regression_suite
 | Test case | Ground truth | Ground truth method | Expected result | Actual result | Abs. error |
 |---|---|---|---|---|---|
 | Real ring A (steel ring, mild angle) | ~17mm | ruler (coarse) | ACCEPT | ACCEPT, 17.07mm | not precisely scoreable — ruler too coarse for sub-mm ground truth |
-| Real ring B (keyring-style ring) | 27.00mm | ruler | ACCEPT | ACCEPT, 26.47mm | 0.53mm |
+| Real ring B (keyring-style ring) | 27.00mm | ruler | ACCEPT | ACCEPT, 26.80mm | 0.20mm |
 | Real ring B, downscaled ~2.06x (same ring/photo, resolution reduced to match a real problem upload) | 27.00mm (same ring as above) | ruler (same measurement, reused) | **REJECT** | REJECT — `RESOLUTION_TOO_LOW` | n/a — correctly refuses at a resolution below what detection is validated for, instead of guessing |
 | Synthetic clean baseline | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.36mm | 0.04mm |
 | Synthetic specular highlight | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.40mm | 0.00mm |
@@ -143,166 +143,138 @@ Full pass/fail table, from the delivered code, `python3 backend/regression_suite
 | Synthetic wide scene (ring small in frame) | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.57mm | 0.17mm |
 | Synthetic decoy object (adversarial second circle) | 17.40mm | rendered (exact) | ACCEPT (ignore decoy) | ACCEPT, 17.53mm | 0.13mm |
 
-**11/11 pass** against `regression_suite.py`'s `CASES` at delivery time,
-including the updated expectation for Real ring A (see below - now an
-intentional REJECT, not the same "pass" as before this revision). Every
-rejected case rejects for the reason the test was designed to trigger,
-not an unrelated failure.
+**11/11 pass** against `regression_suite.py`'s `CASES` at delivery time.
+Every rejected case rejects for the reason the test was designed to
+trigger, not an unrelated failure.
 
-**Detection architecture (current):** redesigned around finding the
-inner hole directly, not around scoring which circle looks "strongest."
-The previous design (described above until this revision) scored
-candidates by closure/cleanliness and cross-method agreement — but a
-ring's *outer* edge, a polished bevel, a specular reflection, or a cast
-shadow can all produce a clean, circular, multi-method-agreed-upon
-boundary just as easily as the true inner hole can. Two methods agreeing
-on a wrong edge is still a failure; low cross-method spread on a wrong
-edge looked, to the old scoring, exactly like confidence.
+**Detection architecture (current — geometry-primary revision):** this
+pipeline has now gone through three designs, and the failure of each is
+what motivated the next, so it's worth recording all three rather than
+just the current one:
+
+1. *Strongest-circle scoring* (earliest version) — picked whichever
+   candidate looked cleanest/most circular with the most cross-method
+   agreement. Failed because a ring's outer edge, a bevel, a reflection,
+   or a cast shadow can all look just as clean as the true inner hole,
+   and multiple edge-based methods can agree on the same wrong one.
+2. *Material-contrast as a hard gate* (previous revision) — required
+   every candidate's interior to match this photo's own sampled
+   background color (`validate_material_contrast`), and required the
+   independent color-topology detector (`enclosed_hole_candidates`,
+   family `holecolor`) to confirm a cluster before ACCEPT. This closed
+   the false-accepts from (1), but overcorrected: normal photos with a
+   small shadow or specular highlight on the hole interior or the
+   background right around the ring routinely broke the color match even
+   when the boundary itself was perfectly visible and correctly located
+   by every edge-based method. Real ring A (below) was a documented,
+   reported casualty of exactly this — refused even though the edge
+   families measured it correctly.
+3. **Geometry-primary (current)** — makes geometry the primary
+   acceptance signal and demotes color/background similarity to a weak,
+   non-blocking supporting cue, per explicit instruction, so that normal
+   consumer photos with small shadows/reflections are accepted while
+   genuinely ambiguous cases still aren't.
 
 ArUco calibration, perspective rectification, and the Hough-based outer-
-ring localization are unchanged and still run first — but strictly for
+ring localization are unchanged and still run first — strictly for
 coarse ROI localization ("roughly where is the ring"), never for
-deciding which boundary inside that ROI is the right one. Inside the
-ROI, every candidate boundary — from the existing contour-based
-Canny/adaptive/Otsu variants, the radial-histogram fallback, *and* a new
-independent `holecolor` family described below — must now pass a
-**material-contrast gate** before it is even allowed to compete for
-cross-method agreement: `validate_material_contrast` samples the color
-(Lab space) just inside the candidate boundary and in a narrow band just
-outside it, and compares both against this specific photo's own sampled
-background color (`sample_background_reference`, median + MAD over the
-rectified frame with the marker and ring ROI excluded — self-calibrating
-per photo, never a fixed absolute color, so it doesn't depend on table
-color or lighting). A candidate is rejected unless its interior matches
-the background and its exterior is meaningfully different from it. This
-targets each reported failure mode structurally, not by threshold
-tuning: the *outer* ring edge is rejected because just past it is
-background again — no contrast; a bevel or reflection is rejected
-because its interior is still ring material, not background; a cast
-shadow is rejected because both sides of it are still background (same
-color, different brightness only).
+deciding which boundary inside that ROI is the right one.
 
-`enclosed_hole_candidates` (family name `holecolor`) is a new,
-independent detection method that finds the hole directly instead of
-inferring it from edges: it segments background-colored pixels in the
-ROI via Lab-distance thresholding, then uses connected-component
-topology (`cv2.connectedComponents`) to find islands of that color fully
-enclosed by non-background material — which is what a hole structurally
-*is*, and what an outer edge, bevel, or shadow artifact structurally is
-not. This genuinely diversifies the method ensemble (a topological method
-alongside the existing edge/contour methods) rather than adding another
-variant of the same edge-detection idea.
+The boundary decision now runs on **geometric evidence** computed per
+candidate (`geometric_plausibility`, `edge_support_fraction`):
 
-Only *after* a candidate clears the material-contrast gate does
-cross-family agreement apply (still requires candidates from >=2
-distinct families, spatial agreement within a real-space tolerance).
-Because every candidate reaching that stage has already been confirmed
-to look like an actual hole, low spread among already-rejected
-candidates can no longer produce a false accept — agreement is only
-ever measured among candidates that passed the physical check first.
+- **Containment + concentricity** with the coarse ROI hint — a candidate
+  must be smaller than, and roughly centered with, the localized ring.
+  Checked against the coarse Hough hint itself now (not against a second,
+  independently-detected "outer partner" contour, which was far more
+  fragile), with a deliberately generous concentricity tolerance — see
+  the field-test finding below for exactly why tight tolerance here was a
+  mistake.
+- **Visible boundary coverage %** (`edge_support_fraction`) — the
+  fraction of a candidate ellipse's own perimeter that has real edge
+  support *somewhere* across the union of every segmentation variant,
+  sampled in angular bins. This is the **partial-boundary tolerance**:
+  a boundary that's 80% visible with a 20% arc obscured by a shadow or
+  highlight scores 0.80 and can still be accepted, instead of being
+  discarded because the one contour that traced it wasn't fully closed.
+  Candidates need >55% coverage to be considered at all.
+- **Ellipse fit residual** — how well a candidate's own points actually
+  lie on its fitted ellipse (generous but finite cap, not fitted to any
+  photo's known diameter).
+- **Cross-family / cross-variant stability** — unchanged in spirit from
+  the previous revision: a cluster only drives ACCEPT when candidates
+  from at least two independent families (canny/adaptive/otsu/holecolor/
+  radial-fallback) land within 1.0mm of each other *and* agree spatially
+  (their centroids agree within 2.0mm) — this is still "more than one
+  method found the same thing," it's just no longer required to
+  specifically include `holecolor`.
 
-A debug overlay mode (`RING_DEBUG_OVERLAY=1` env var) renders the ROI,
-every validated candidate boundary (color-coded by family), every
-rejected candidate with its specific rejection reason, and the final
-selected boundary, for visual auditing of exactly what the pipeline
-considered and why it picked (or didn't pick) a given edge.
+Color/background similarity (`validate_material_contrast`,
+`enclosed_hole_candidates`) is still computed and `holecolor` still
+contributes as one more independent family/vote — it's simply no longer
+a pass/fail gate. It's used only (a) as one more candidate source, same
+as any edge-based family, and (b) as a tie-breaker/confidence annotation
+when more than one cluster would otherwise qualify equally on geometry. A
+photo with no usable background reference now proceeds on geometry alone
+instead of hard-rejecting (`BACKGROUND_REFERENCE_UNAVAILABLE` is retired).
 
-**Safety hardening (this revision) — five specific gaps closed, on
-request, after review of the redesign above:**
+A debug overlay mode (`RING_DEBUG_OVERLAY=1`) renders the ROI, every
+geometrically-accepted candidate (color-coded by family), every rejected
+candidate with its specific reason (`NOT_CONCENTRIC`, `NOT_CONTAINED`,
+`LOW_BOUNDARY_COVERAGE`, `HIGH_FIT_RESIDUAL`), and the final selected
+boundary.
 
-1. **No more geometry-only fallback when the background can't be
-   sampled.** `validate_material_contrast` used to SKIP its own check
-   (return "passed") when `sample_background_reference` came back `None`
-   (e.g. ring+marker filling nearly the whole frame) - silently reopening
-   exactly the "accept on geometry alone" failure mode the whole redesign
-   exists to close, for that one edge case. `measure_ring` now checks for
-   this immediately and returns a dedicated retake reason,
-   `BACKGROUND_REFERENCE_UNAVAILABLE`, before any candidate is even
-   generated; `validate_material_contrast` itself now rejects (not skips)
-   on a missing reference too, as a defensive second layer.
-2. **The center-agreement tolerance was NOT loosened to fit one photo.**
-   An earlier version of this file raised `CENTER_AGREEMENT_THRESHOLD_MM`
-   from 2.0mm to 3.0mm specifically because Real ring B showed a ~2.5mm
-   `holecolor`-vs-`canny` center gap - textbook per-photo tolerance
-   tuning, which this project's own policy forbids. Investigated instead:
-   the cause was `sample_background_reference` using a single whole-frame
-   background estimate, which under uneven real-world lighting can
-   mismatch the wood color *right around the ring*, causing
-   `enclosed_hole_candidates`'s background-color segmentation to be
-   asymmetric and its fitted center to drift. Fixed at the source (see
-   #3) and the threshold reverted to 2.0mm - the value already validated
-   (not discovered by tuning) against the adversarial-decoy case.
-3. **Background is now sampled locally, near the ring, not just
-   globally.** `sample_background_reference` now prefers an annulus
-   sampled just outside the localized ring (falling back to the old
-   whole-frame estimate only if that annulus is too small/unavailable) -
-   because a table's wood grain and lighting are not uniform across a
-   whole photo, and what the material-contrast gate and the hole detector
-   actually need is what "background" looks like immediately around the
-   ring, not an average pulled off by a corner of the frame nowhere near
-   it. This is also what made #2's fix possible without loosening
-   anything.
-4. **ACCEPT now requires the topological detector, not just any two edge
-   methods.** Canny/adaptive/Otsu (and the radial fallback, which
-   inherits its variant's family name) are all gradient/edge-based
-   methods derived from the same grayscale image - this file already
-   documents them failing together in the same direction (the dilate-bias
-   bug: all 4 Canny variants wrong the same way at once). Two of them
-   agreeing was previously enough for cross-family consensus, but that is
-   not independent confirmation - it can be the same underlying mistake
-   counted twice. A cluster can now only ACCEPT if it contains `holecolor`
-   (the connected-component/color-topology detector) together with at
-   least one edge-based family; edge-only agreement, however tight, no
-   longer qualifies. Real ring B still accepts under this rule at
-   26.80mm (0.20mm error vs. 27.00mm ground truth - tighter than before,
-   from the local-background fix in #3). **Real ring A now correctly
-   RETAKEs** - see the dedicated note below; this is a reported
-   consequence of the stricter rule, not a bug.
-5. Two supporting fixes were needed to make #3/#4 actually work rather
-   than just rejecting everything: (a) `locate_outer_ring_circle`'s Hough
-   search used to require its own circle to show smaller nested
-   structure, which fails on a clean/high-contrast photo where the INNER
-   hole is the single most prominent circle (there's nothing smaller
-   nested inside it) - it now falls back to the largest plausible Hough
-   circle when nothing validates, and `measure_ring` cross-checks/expands
-   that radius against the independent contour candidates it already
-   computes, so downstream localization isn't silently undersized. (b)
-   The interior-background match itself is now judged by CHROMA (Lab
-   a*/b*) plus a *bounded* brightness allowance rather than one combined
-   brightness+chroma distance: a ring physically shadows its own hole, so
-   what's visible through a genuine hole is often legitimately darker
-   than the open table beside the ring without being a different surface
-   at all - an earlier attempt to fix this by ignoring darkness entirely
-   turned out to be wrong (it also let an achromatic ring band pass as
-   "background" whenever the band and the background were both close to
-   gray, differing mainly in brightness), so darker is tolerated only up
-   to a fixed, generous-but-finite bound
-   (`max_interior_darkness_z=6.0`), reasoned from the largest genuine
-   self-shadow effect actually observed, then checked against the whole
-   suite as a fixed rule.
+**Field-test finding that shaped this revision (unseen real photo, not
+in the regression suite, no known ground truth):** while evaluating
+three new real ring photos supplied for exactly this purpose, one (a
+metal cap/bushing with a small, deep, self-shadowed through-hole) exposed
+a real bug in the first implementation of `geometric_plausibility`: its
+concentricity check compared every candidate's center against the coarse
+Hough ROI hint's own center with a fairly tight tolerance. On this photo
+the Hough hint's center was itself measurably off (the band's texture
+throws off Hough's circle fit), so a candidate at ~21.2mm that TWO
+independent families (`canny` and `holecolor`) agreed on tightly
+(within 0.12mm of each other, both with full 100% boundary coverage and
+near-zero fit residual) was being discarded purely for disagreeing with
+an imprecise localization hint — while a geometrically weaker but
+hint-centered cluster at ~27–28mm (partial coverage 0.6–0.7, and flagged
+by every color check as *not* background-like — consistent with being
+the cap's outer rim, not the hole) would otherwise have won. The fix:
+loosen the concentricity tolerance substantially (0.18 → 0.4 of the
+hint's own radius), reasoned from this concrete structural
+observation — the hint is documented elsewhere in this file as coarse
+localization, not a precise center — and letting the *cross-family
+consensus* check later in `measure_ring` (which compares candidates to
+*each other*, not to the one-shot hint) be the better-informed judge of
+"do independent methods agree on where." Re-validated against the whole
+regression suite (still 11/11) after the change, not against this
+photo's own (unknown) diameter — there is no ground truth for it in this
+project's test set. With the fix, the pipeline correctly selects the
+~21.2mm cluster (visually confirmed via the debug overlay: the selected
+boundary traces the true small opening, not the larger metal rim). The
+other two new photos could not be evaluated under the new logic at all:
+both are blocked by the pre-existing, unrelated `RESOLUTION_TOO_LOW` gate
+(their marker measures ~223–247px, below the 300px floor — likely an
+artifact of chat-upload resizing) — full-resolution originals were
+requested but not yet received as of this delivery.
 
-**Real ring A: a known, reported, and deliberate new REJECT.** Inspecting
-the rectified crop directly (not just the numbers) shows why: this ring's
-band is heavily hammered/textured, and the hole interior itself has a
-strong specular highlight cutting across it. The edge-based families
-still find the true boundary and agree tightly (canny/adaptive/otsu all
-converge on ~16.5-17mm, matching this ring's previously-recorded ~17mm
-ground truth, confirmed visually - the debug overlay's colored rings sit
-right on the true inner edge). But `enclosed_hole_candidates` cannot
-produce ANY valid candidate here: the highlight splits the hole's
-background-colored region into a non-convex crescent that fails the
-circularity filter, contributing zero candidates rather than a wrong one.
-Under rule #4 above, edge-only agreement is no longer sufficient, so this
-photo now returns `RING_EDGE_UNSTABLE` instead of a measurement.
-`regression_suite.py`'s expected outcome for this case was updated to
-`REJECT` to match, with a comment explaining exactly this - not loosened
-back down to force it to ACCEPT again. This is the real, visible
-trade-off of requiring independent topological confirmation: a real
-photo that a human could measure correctly by eye, and that the edge
-methods DID measure correctly, is now refused because one specific
-detection strategy couldn't independently confirm it. Reported as-is,
-per instruction, rather than hidden by re-loosening rule #4 for this one
-case.
+**Real ring A: no longer a documented REJECT.** Under the previous
+revision's mandatory topological-confirmation rule, this photo (heavily
+hammered/textured band, a specular highlight bisecting the hole
+interior) was a reported, intentional REJECT: `enclosed_hole_candidates`
+couldn't produce a valid candidate (the highlight splits the hole's
+background-colored region into a non-convex crescent that fails its own
+circularity filter), and edge-only agreement was, by that revision's own
+rule, no longer sufficient. Under the geometry-primary rule that
+requirement no longer applies, and every edge-based family still finds
+and tightly agrees on the true boundary (partial coverage well above the
+55% floor, since the highlight only obscures a minority arc) — so this
+photo now correctly **ACCEPTs at 17.07mm**, consistent with its
+previously-recorded ~17mm ground truth. `regression_suite.py`'s expected
+outcome was updated back to `ACCEPT` to match — the second time this
+one case's expectation has changed as the underlying rule changed, each
+time honestly re-validated against the whole suite rather than special-
+cased for this one photo.
 
 ### Observed failures and limitations
 
@@ -349,12 +321,17 @@ case.
   reflective ring at all (0 of 6 segmentation variants produced a closed
   contour on Real ring B in testing); the radial-histogram fallback that
   handles this is real but coarser (cross-method spread 0.20–0.8mm on
-  real photos vs. ~0.04mm on clean synthetic renders). Heavy hammered
-  texture combined with a specular highlight bisecting the hole interior
-  can additionally defeat the independent topological (`holecolor`)
-  confirmation entirely (see Real ring A above) even when the edge-based
-  methods still measure correctly - this is now a documented REJECT
-  case, not silently accepted on edge-agreement alone.
+  real photos vs. ~0.04mm on clean synthetic renders). Under the
+  geometry-primary revision, heavy hammered texture with a specular
+  highlight bisecting the hole interior (Real ring A) no longer defeats
+  measurement on its own — partial-boundary coverage tolerates the
+  obscured arc, and color/background similarity is no longer required to
+  confirm the cluster — but a *stable, well-covered, wrong* boundary (a
+  bevel or inner rim rather than the true through-hole) is a real,
+  demonstrated risk of geometry alone with no fallback color check; see
+  the field-test finding above for a concrete case where this nearly
+  happened and how cross-family + coverage evidence resolved it
+  correctly instead.
   A **wrong-but-confident** fix for one specific low-contrast reflective
   photo was found, verified to be wrong (23.47mm vs 27mm ground truth by
   directly downscaling the same validated photo), and reverted rather

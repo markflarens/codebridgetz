@@ -32,59 +32,87 @@ test photo it is or what its known diameter is. Concretely:
   ambiguous to trust, should return a specific retake reason - never an
   unreliable number dressed up as a confident one.
 
-DETECTION ARCHITECTURE (redesigned around inner-hole segmentation, not
-strongest-circle detection): earlier versions of this file scored
-candidate circles by how clean/closed/circular they looked and by how
-many segmentation methods agreed on one - which a ring's OUTER edge, a
-polished bevel, a specular reflection, or a cast shadow can all satisfy
-just as well as the true inner hole, and multiple methods CAN agree on
-the same wrong one (a real, confirmed failure mode: two methods agreeing
-is not evidence they found the right edge, only that they found the same
-edge). ArUco calibration, perspective rectification, and Hough circle
-detection (locate_outer_ring_circle) are kept, but strictly for coarse
-ROI localization - "roughly where is the ring" - never for deciding which
-boundary inside that ROI is correct.
+DETECTION ARCHITECTURE (GEOMETRY-PRIMARY REVISION - current): earlier
+revisions of this file went through two designs worth understanding
+because the failures of each motivated the next:
 
-The actual boundary decision now runs through validate_material_contrast:
-every candidate, from every family (contour-based, radial-histogram, and
-the enclosed-hole detector below), must have an INTERIOR that matches
-this photo's own sampled background color (sample_background_reference)
-and an immediate EXTERIOR that is meaningfully different from it, before
-it is even allowed to compete for cross-method agreement. This directly
-targets each of the reported failure modes: the outer edge fails because
-just past it is background again (no contrast); a bevel/reflection fails
-because its interior is still ring material, not background; a cast
-shadow fails because both sides of it are still background. Cross-family
-agreement (still required, still >=2 distinct families) is therefore
-agreement among candidates that have ALREADY been confirmed to look like
-an actual hole - low spread among rejected candidates can no longer
-produce a false accept, because rejected candidates never reach that
-stage.
+  1. "Strongest circle" scoring - picked whichever candidate looked
+     cleanest/most circular and had the most cross-method agreement. Fails
+     because a ring's OUTER edge, a polished bevel, a specular reflection,
+     or a cast shadow can all look just as clean/circular as the true
+     inner hole, and multiple edge-based methods CAN agree on the same
+     wrong one (confirmed: the dilate-bias bug made all 4 canny variants
+     wrong in the same direction at once).
+  2. "Material-contrast as a hard gate" - required every candidate's
+     interior to match this photo's own sampled background color
+     (validate_material_contrast) before it could even compete, and
+     required the independent color-topology detector (enclosed_hole_-
+     candidates, family "holecolor") to confirm a cluster before ACCEPT
+     (has_topological_confirmation). This closed the false-accept failures
+     from (1), but turned out to overcorrect: normal consumer photos with
+     small shadows, specular highlights, or local illumination changes on
+     the hole interior or the background right around the ring routinely
+     broke the background/hole color match even though the boundary
+     itself was perfectly visible and correctly located by every
+     edge-based method - a real, reported regression (a known-good real
+     ring photo, and a previously-false-accepting photo that correctly
+     started REJECTing instead of being fixed, both started being refused
+     for a reason that had nothing to do with whether the boundary could
+     actually be found).
 
-enclosed_hole_candidates is a new, independent family ("holecolor") that
-finds the hole directly rather than inferring it from edges: it segments
-background-colored pixels in the ROI and uses connected-component
-topology to find islands of that color fully enclosed by non-background
-material - which is what a hole structurally IS, and what an edge
-artifact structurally is NOT.
+This revision (3) makes GEOMETRY the primary acceptance signal and
+demotes color/background similarity to a weak, non-blocking supporting
+cue, per explicit instruction: a photo should be accepted when its inner
+boundary can be geometrically recovered with sufficient stability, even
+if a shadow or highlight locally discolors part of the hole or the
+background next to the ring - and rejected only when the boundary itself
+cannot be recovered that way, not because of a color mismatch alone.
 
-SAFETY HARDENING (later revision): ACCEPT now requires "holecolor" plus
-at least one edge-based family in the same cluster - see
-has_topological_confirmation in measure_ring. Two edge-based families
-(canny/adaptive/otsu) agreeing with each other is NOT independent
-confirmation, since they're all gradient-derived from the same grayscale
-image and documented elsewhere in this file as capable of failing
-together (the dilate-bias bug). Background sampling
-(sample_background_reference) now prefers a LOCAL annulus around the
-ring over a whole-frame estimate, since lighting/table color are not
-uniform across a whole photo - this is also what makes the interior
-check tolerate a ring casting its own shadow into its own hole without
-losing the ability to reject an achromatic ring band that only differs
-from the background in brightness (see validate_material_contrast and
-enclosed_hole_candidates' docstrings for the chroma/brightness split
-this required). A missing background reference is now a hard retake
-(BACKGROUND_REFERENCE_UNAVAILABLE), never a silent fallback to
-geometry-only acceptance.
+ArUco calibration, perspective rectification, and Hough circle detection
+(locate_outer_ring_circle) are kept exactly as before, strictly for
+coarse ROI localization - "roughly where is the ring" - never for
+deciding which boundary inside that ROI is correct.
+
+The boundary decision now runs on GEOMETRIC EVIDENCE, computed per
+candidate (see geometric_plausibility, edge_support_fraction):
+  - containment inside the outer ring boundary, and concentricity with it
+    (geometric_plausibility, checked against outer_ring_hint - no longer
+    against another independently-detected "outer partner" candidate,
+    which was a much stricter and more fragile requirement);
+  - visible boundary coverage % (edge_support_fraction): the fraction of
+    the candidate ellipse's own perimeter that has real edge support
+    SOMEWHERE across the union of every segmentation variant, sampled in
+    angular bins rather than requiring one single contour to be fully
+    closed. This is the PARTIAL-BOUNDARY TOLERANCE the old closed-contour-
+    only circularity >= 0.65 gate did not allow: a boundary that is, say,
+    80% visible with a 20% arc obscured by a shadow or a specular
+    highlight now scores 0.80 coverage and can still be accepted, rather
+    than being thrown out because the one contour that happened to trace
+    it was broken into two pieces by that arc;
+  - ellipse/circle fit residual (how well the candidate's points actually
+    lie on its fitted ellipse - unchanged metric, now reported alongside
+    coverage rather than being the only closure signal);
+  - cross-variant / cross-family stability: a candidate only drives an
+    ACCEPT when candidates from at least two independent families
+    (canny/adaptive/otsu/holecolor/radial-fallback) land within
+    CLUSTER_TOL_MM of each other AND agree spatially (not just on
+    diameter) - unchanged from earlier revisions, this is still the
+    "more than one method found the same thing" check, it is just no
+    longer required to specifically include the "holecolor" family.
+
+Color/background similarity (validate_material_contrast,
+enclosed_hole_candidates' background-color segmentation,
+sample_background_reference) is still computed and still contributes
+"holecolor" as one more independent family/vote in the geometry-driven
+consensus above - it is simply no longer a pass/fail gate that can reject
+a geometrically well-supported boundary on its own. It is used only: (a)
+as one more candidate source among several, exactly like any edge-based
+family, and (b) as a tie-breaker/confidence annotation when more than one
+cluster would otherwise qualify. A photo with no usable background
+reference (sample_background_reference returns None) no longer hard-
+rejects - it simply proceeds without that one supporting signal, relying
+on geometry alone, which is consistent with "color is a secondary
+confidence cue, not a requirement."
 """
 import os
 import cv2
@@ -137,6 +165,15 @@ class MeasurementResult:
         # logged) so a debug overlay can show exactly what was rejected and
         # why, not just what was accepted.
         self.rejected_candidates = []
+        # GEOMETRY-PRIMARY REVISION: reporting fields for the winning
+        # candidate's own geometric evidence, per the explicit ask to be
+        # able to report "selected inner boundary, fitted ellipse, visible
+        # boundary coverage %, fit residual, accepted/rejected, measured
+        # diameter" for any photo evaluated against this pipeline.
+        self.boundary_coverage = None   # fraction [0,1], see edge_support_fraction
+        self.fit_residual = None        # None when the winning candidate came from a
+                                         # source with no residual concept (radial peak/holecolor)
+        self.color_confidence = None    # weak secondary cue only, never gates ACCEPT/REJECT
 
 def find_marker_corners(gray):
     """Single source of truth for locating OUR marker (by exact ID) in an
@@ -349,30 +386,52 @@ def segmentation_candidates(rect_gray, marker_mask):
         out.append((name, e))
     return out
 
-def all_ring_candidates(edge_map, min_diam_px=30):
-    """Return every plausible circular contour, not just the single 'best' one.
+def all_ring_candidates(edge_map, min_diam_px=30, min_circularity=0.35, min_axis_ratio=0.6):
+    """Return every plausible elliptical contour, not just the single 'best' one.
     We deliberately do NOT pick by score alone: a ring's OUTER edge is often just
     as circular/clean as its INNER edge (the hole), so a pure quality score
     tends to latch onto the outer boundary. Domain knowledge - the hole is
-    always the smaller of the (roughly concentric) candidates - has to be
-    applied explicitly by the caller."""
+    always the smaller of the (roughly concentric) candidates - is applied by
+    the caller via geometric_plausibility(), not here.
+
+    GEOMETRY-PRIMARY REVISION: min_circularity was 0.65, which in practice
+    required a contour to be close to a fully CLOSED loop - exactly the
+    requirement that made this pipeline reject normal photos where a small
+    shadow or specular highlight splits the true inner-boundary contour into
+    an open arc or two disconnected pieces. Lowered to 0.35 (still enough to
+    exclude genuinely non-circular junk - a stray line segment or a sharp
+    corner scores far below that) so a partial boundary can still produce an
+    ellipse-fit candidate here; whether that partial boundary is actually
+    trustworthy is now decided downstream by edge_support_fraction (how much
+    of the fitted ellipse's full perimeter has real edge support ANYWHERE
+    across all segmentation variants, not just in this one contour) and by
+    fit residual - genuine geometric evidence, not by requiring the one
+    contour that happened to trace it to already be a closed loop.
+    min_axis_ratio similarly loosened (0.75 -> 0.6): a partial arc's own
+    least-squares ellipse fit is noisier than a fully closed contour's, so a
+    slightly looser axis-ratio floor avoids discarding an otherwise-good
+    partial candidate purely for a fitting artifact - axis_ratio still feeds
+    into the candidate's score either way.
+    """
     contours, _ = cv2.findContours(edge_map, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
     candidates = []
     for c in contours:
-        area = cv2.contourArea(c)
-        if area < 300 or len(c) < 20:
+        if len(c) < 20:
             continue
         perim = cv2.arcLength(c, True)
         if perim == 0: continue
+        area = cv2.contourArea(c)
         circularity = 4*np.pi*area/(perim*perim)
-        if circularity < 0.65:
+        if circularity < min_circularity:
             continue
+        if len(c) < 5:
+            continue  # fitEllipse requires >= 5 points
         ellipse = cv2.fitEllipse(c)
         (cx,cy),(MA,ma),angle = ellipse
         if MA == 0 or ma == 0 or MA < min_diam_px:
             continue
         axis_ratio = min(MA,ma)/max(MA,ma)
-        if axis_ratio < 0.75:
+        if axis_ratio < min_axis_ratio:
             continue
         pts = c.reshape(-1,2).astype(np.float32)
         dists = []
@@ -388,40 +447,126 @@ def all_ring_candidates(edge_map, min_diam_px=30):
                                 residual=residual, score=score, diam_px=(MA+ma)/2, center=(cx,cy)))
     return candidates
 
-def inner_boundary_from_candidates(candidates, quality_floor=0.5,
-                                    min_band_ratio=1.03, max_band_ratio=1.8,
-                                    max_center_offset_px=8):
-    """Among plausible circular contours, pick the one that looks like the
-    INSIDE of a ring band - not just "the smallest circle anywhere in the
-    scene". A lone small circle (a decoy: coin, button, printed dot,
-    reflection) can otherwise win purely for being small and round, and -
-    critically - do so CONSISTENTLY across every segmentation method, since
-    the bias is in the shared heuristic, not in per-method noise. Cross-
-    family spatial consensus alone does NOT catch this, because agreeing
-    families can agree on the same wrong object.
 
-    Fix: require a genuine ring-band structure. For a candidate to be
-    accepted as the inner boundary, there must ALSO be a larger, roughly
-    concentric candidate in the same edge map (its plausible outer edge).
-    A lone circle with no larger concentric partner is rejected outright,
-    regardless of how clean/circular it looks.
+def edge_distance_transform(edge_map):
+    """Precompute, once per edge map, the distance (in px) from every pixel
+    to the nearest edge pixel. Reused by edge_support_fraction for every
+    candidate ellipse checked against this edge map, so the expensive part
+    (the transform itself) is paid once, not once per candidate."""
+    inv = cv2.bitwise_not(edge_map)
+    return cv2.distanceTransform(inv, cv2.DIST_L2, 3)
+
+
+def edge_support_fraction(edge_dist, ellipse, shape, n_bins=72, tol_px=4.0):
     """
-    good = [c for c in candidates if c['score'] > quality_floor]
-    if not good:
-        return None
+    THE partial-boundary-tolerant coverage metric: what fraction of a
+    candidate ellipse's own perimeter has real edge support SOMEWHERE,
+    sampled at n_bins evenly-spaced angles rather than requiring one single
+    contour to already be a fully closed loop.
 
-    good_sorted = sorted(good, key=lambda c: c['diam_px'])
-    for inner in good_sorted:
-        icx, icy = inner['center']
-        for outer in good:
-            if outer is inner:
-                continue
-            ocx, ocy = outer['center']
-            center_offset = np.hypot(icx-ocx, icy-ocy)
-            ratio = outer['diam_px'] / inner['diam_px']
-            if center_offset <= max_center_offset_px and min_band_ratio <= ratio <= max_band_ratio:
-                return inner  # confirmed: this circle has a plausible concentric outer partner
-    return None  # no candidate had a matching ring-band partner - don't guess
+    This is deliberately computed against edge_dist - typically a distance
+    transform of the UNION of every segmentation variant's edge map, not
+    just the one variant that happened to produce this particular candidate
+    - so a boundary that's cleanly visible in, say, adaptive-threshold but
+    broken into two arcs by a highlight in canny still gets credited with
+    high coverage: the true physical boundary is there, even if any single
+    method's own contour-closure test would have missed it.
+
+    A small shadow or specular highlight affecting a MINORITY arc of an
+    otherwise-visible boundary costs that arc's share of bins, not the
+    whole candidate - exactly the "accept if a large majority of the inner
+    boundary is visible" tolerance asked for, instead of an all-or-nothing
+    closed-contour requirement.
+
+    Returns a float in [0, 1]; 0.0 if no perimeter samples land inside the
+    image (degenerate ellipse).
+    """
+    (cx, cy), (MA, ma), angle = ellipse
+    h, w = shape
+    cos_a, sin_a = np.cos(np.radians(angle)), np.sin(np.radians(angle))
+    thetas = np.linspace(0, 2*np.pi, n_bins, endpoint=False)
+    ex = (MA/2.0) * np.cos(thetas)
+    ey = (ma/2.0) * np.sin(thetas)
+    xs = cx + ex*cos_a - ey*sin_a
+    ys = cy + ex*sin_a + ey*cos_a
+    xi = np.round(xs).astype(np.int32)
+    yi = np.round(ys).astype(np.int32)
+    in_bounds = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
+    if not np.any(in_bounds):
+        return 0.0
+    xi, yi = xi[in_bounds], yi[in_bounds]
+    dists = edge_dist[yi, xi]
+    supported = np.count_nonzero(dists <= tol_px)
+    return float(supported) / float(len(xi))
+
+
+def geometric_plausibility(diam_px, center, outer_ring_hint,
+                            min_band_ratio=1.03, max_band_ratio=3.2,
+                            max_center_offset_frac=0.4):
+    """
+    Structural "could this be the ring's inner hole, given roughly where the
+    ring is" check - CONTAINMENT inside the outer ring boundary, and
+    CONCENTRICITY with it, per the geometry-primary redesign. Checked
+    against outer_ring_hint (the coarse Hough/contour-refined localization
+    that is already computed once per photo), not against a second,
+    independently-detected "outer partner" candidate the way an earlier
+    revision's inner_boundary_from_candidates required - that was a much
+    stricter, more fragile requirement (it needed TWO separate contours in
+    the SAME edge map to both survive and pair up), and it's redundant with
+    outer_ring_hint, which already answers "roughly where and how big is the
+    ring" for the whole photo.
+
+    max_band_ratio widened from the old inner/outer pairing's 1.8 to 3.2:
+    that 1.8 cap was calibrated for "this candidate's own paired outer
+    contour", which by construction couldn't be far off; here it's compared
+    against the coarse Hough hint, which can legitimately be a good deal
+    larger than the true inner hole for a thick-banded ring. 3.2 stays a
+    physically-reasoned, generous but finite bound (a ring whose hole is
+    less than ~a third of its outer diameter is already an unusually thick
+    band) rather than removing the containment check altogether.
+
+    max_center_offset_frac=0.4 (not a tight value): outer_ring_hint is
+    documented elsewhere in this file as COARSE localization only, and on
+    an irregular/hammered band its Hough-fitted center can genuinely be
+    some way off from the ring's true center - confirmed directly on a real
+    photo during this redesign's own testing: an independent edge family
+    AND the independent holecolor (color-topology) family agreed tightly
+    with each other (within ~0.1mm) on a candidate whose center sat ~0.32x
+    outer_ring_hint's own radius away from outer_ring_hint's center - well
+    past an earlier, tighter 0.18 value this function was first written
+    with, which discarded that cross-family-corroborated candidate for no
+    reason other than the coarse hint itself being imprecisely centered.
+    0.4 still rejects a candidate that's nowhere near the localized ring at
+    all (the marker, background clutter, a decoy object elsewhere in
+    frame), while no longer second-guessing a candidate that two
+    INDEPENDENT families already agree on just because the one-shot Hough
+    hint's own center estimate was off - the cross-family spatial consensus
+    check later in measure_ring (CENTER_AGREEMENT_THRESHOLD_MM) is the
+    better-informed judge of "do independent methods agree on WHERE",
+    since it compares candidates to each other, not to a single coarse
+    hint. This was found and reasoned from that structural testing
+    observation, not from comparing output to this photo's own (unknown)
+    true diameter - no ground truth for that photo exists in this
+    pipeline's test set.
+
+    Returns (passed: bool, info: dict) with the raw offset/ratio for
+    reporting, even on a pass.
+    """
+    if outer_ring_hint is None:
+        return True, {"center_offset_frac": None, "outer_inner_ratio": None}
+    ocx, ocy, orad = outer_ring_hint
+    cx, cy = center
+    offset = float(np.hypot(cx - ocx, cy - ocy))
+    offset_frac = offset / max(1.0, orad)
+    ratio = orad / max(1.0, diam_px / 2.0)
+    info = {"center_offset_frac": offset_frac, "outer_inner_ratio": ratio}
+    if offset_frac > max_center_offset_frac:
+        info["reason"] = "NOT_CONCENTRIC"
+        return False, info
+    if not (min_band_ratio <= ratio <= max_band_ratio):
+        info["reason"] = "NOT_CONTAINED"
+        return False, info
+    return True, info
 
 
 def _radial_edge_histogram(gray_for_gradient, edge_map, center, outer_radius_px,
@@ -837,18 +982,22 @@ def validate_material_contrast(rect_lab, ellipse, bg_ref,
     Returns (passed: bool, info: dict) - info always carries enough (d_in,
     d_out, and on failure a reason code) to drive a debug overlay.
 
+    GEOMETRY-PRIMARY REVISION: this function's result is no longer a hard
+    gate in measure_ring() - it is one soft, secondary confidence signal
+    (color_confidence) among several, used only to break ties between
+    otherwise-equally-good geometric clusters. A `False` return here no
+    longer removes a candidate from consideration on its own.
+
     When bg_ref is None (sample_background_reference couldn't get a
     trustworthy background sample - e.g. the ring/marker occupying nearly
     the whole frame, or the local annulus and the whole-frame fallback both
-    coming up short), this REJECTS every candidate rather than skipping the
-    check. Without a background reference there is no way to tell an actual
-    hole from the outer edge/a bevel/a reflection/a shadow - falling back to
-    "accept on geometry alone" here would silently reopen exactly the
-    false-confidence failure mode this whole redesign exists to close.
-    measure_ring() checks for this and returns a dedicated retake reason
-    (BACKGROUND_REFERENCE_UNAVAILABLE) before candidates even reach this
-    function, specifically so that failure is reported honestly instead of
-    manifesting here as a same-looking generic rejection.
+    coming up short), measure_ring() does not even call this function - it
+    simply proceeds on geometry alone with color_confidence left neutral,
+    per the explicit instruction that color/background similarity is a
+    weak supporting cue, not a requirement. (An earlier revision returned
+    False unconditionally here and had measure_ring() hard-reject with a
+    dedicated retake reason, BACKGROUND_REFERENCE_UNAVAILABLE, before any
+    candidate was generated - that reason code no longer exists.)
     """
     if bg_ref is None:
         return False, {"reason": "NO_BACKGROUND_REFERENCE", "d_in": None, "d_out": None}
@@ -1232,8 +1381,9 @@ def measure_ring(photo, verbose_name=""):
     # redesign's scope. locate_outer_ring_circle (Hough) and the ArUco/
     # perspective rectification above tell us roughly WHERE the ring is;
     # neither is trusted to say WHICH boundary inside that ROI is the true
-    # inner hole - that judgment now belongs entirely to the material-
-    # contrast gate below, not to "which circle looks strongest".
+    # inner hole - that judgment now runs on geometric evidence (below),
+    # not on "which circle looks strongest" and not on color/background
+    # similarity either.
     outer_ring_hint = locate_outer_ring_circle(
         rect_gray,
         marker_rect
@@ -1281,120 +1431,158 @@ def measure_ring(photo, verbose_name=""):
                       f"{2*cur_r/PX_PER_MM_OUT:.2f}mm -> {2*best_r/PX_PER_MM_OUT:.2f}mm")
 
     # This photo's own background color/luminance, sampled independently of
-    # any ring/hole candidate - see sample_background_reference's docstring
-    # for why this is the actual fix for "methods agreeing on the wrong
-    # physical edge", not just another geometric heuristic.
+    # any ring/hole candidate - still computed (used below as the weak
+    # SECONDARY confidence cue, and to drive enclosed_hole_candidates/
+    # "holecolor" as one more independent candidate family), but per the
+    # geometry-primary redesign this is no longer required for measurement
+    # to proceed at all. A photo where the local annulus and whole-frame
+    # fallback both come up short (ring/marker filling nearly the whole
+    # frame) simply proceeds on geometry alone, with "holecolor" unable to
+    # contribute a vote and color_confidence left neutral - it is NOT an
+    # honest retake by itself anymore, because a missing color reference
+    # says nothing about whether the boundary itself is geometrically
+    # recoverable.
     rect_lab = cv2.cvtColor(rectified, cv2.COLOR_BGR2LAB).astype(np.float32)
     bg_ref = sample_background_reference(rectified, marker_rect, outer_ring_hint)
 
-    # Without a trustworthy background sample, the material-contrast gate
-    # cannot tell an actual hole from the outer edge/a bevel/a reflection/a
-    # shadow - there is nothing to compare a candidate's interior/exterior
-    # against. This must be an honest retake, not a silent fall-back to
-    # geometry-only acceptance (see validate_material_contrast's docstring
-    # for why letting candidates through unchecked here would reopen the
-    # exact false-confidence failure mode this redesign exists to close).
-    if bg_ref is None:
-        res.reason = "BACKGROUND_REFERENCE_UNAVAILABLE"
-        dbg = rectified.copy()
-        if outer_ring_hint is not None:
-            ocx, ocy, orad = outer_ring_hint
-            cv2.circle(dbg, (int(ocx), int(ocy)), int(orad), (200, 200, 200),
-                       max(3, dbg.shape[1] // 300))
-        cv2.putText(dbg, "No trustworthy background sample - cannot validate inner-hole boundary",
-                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
-        res.debug_img = dbg
-        return res
+    # Union edge map across every segmentation variant, and its distance
+    # transform, computed ONCE and reused by edge_support_fraction for
+    # every candidate from every source (contour-based, radial-peak, and
+    # holecolor alike) - see edge_support_fraction's docstring for why the
+    # UNION (not any single variant's own edge map) is the right thing to
+    # score "visible boundary coverage" against: a boundary that's cleanly
+    # closed in adaptive-threshold but broken into two arcs by a highlight
+    # in canny is still a boundary that's genuinely there, which the union
+    # correctly credits.
+    union_edge = np.zeros_like(rect_gray)
+    for _, edge_map in variants:
+        union_edge = cv2.bitwise_or(union_edge, edge_map)
+    union_edge_dist = edge_distance_transform(union_edge)
+    union_shape = rect_gray.shape
 
-    diam_candidates = []
-    for i,(name, edge_map, all_cands) in enumerate(per_variant_all_cands):
-        # Primary detector: clean closed inner + outer contours.
-        cand = inner_boundary_from_candidates(all_cands)
+    # Geometric acceptance thresholds - reasoned from first principles (what
+    # "a large majority of the boundary is visible" and "a well-fitting
+    # ellipse" should mean), NOT fitted by checking against any specific
+    # photo's known diameter (see the module's no-overfitting policy).
+    # MIN_ACCEPT_COVERAGE=0.55: a boundary with the clear majority (>55%) of
+    # its own perimeter showing real edge support somewhere across every
+    # segmentation variant is "geometrically recoverable" per the explicit
+    # instruction to tolerate a small shadow/highlight arc rather than
+    # requiring full 100% closure. MAX_FIT_RESIDUAL=0.4: residual is the
+    # mean absolute deviation (in normalized ellipse-radius units) of a
+    # contour's own points from their fitted ellipse - 0.4 is a generous
+    # but finite cap that still excludes a badly-fitting, likely-spurious
+    # shape while tolerating ordinary photographic/segmentation noise.
+    MIN_ACCEPT_COVERAGE = 0.55
+    MAX_FIT_RESIDUAL = 0.4
 
-        # Fallback for real reflective rings: allow a partially broken
-        # inner boundary, but ONLY around a ring location that
-        # independently showed outer + inner circular structure.
-        #
-        # MULTIPLE candidates per variant, not one: see
-        # radial_multi_peak_candidates' docstring for why taking only the
-        # single tallest histogram peak per method throws away exactly the
-        # information that lets independent methods rescue each other from
-        # unrelated artifacts. Every returned peak becomes its own entry in
-        # diam_candidates, same as if it were its own detection - the
-        # cross-family clustering below decides which one (if any) has
-        # genuine multi-method support.
-        if cand is None and outer_ring_hint is not None:
-            outer_cx, outer_cy, outer_radius = outer_ring_hint
+    diam_candidates = []   # (name, diameter_mm, cand) - passed all geometric checks
+    rejected = []           # (name, diameter_mm, cand, reason) - for the debug overlay
+
+    def consider(name, cand):
+        """
+        Score ONE candidate ellipse (from any source - closed/partial
+        contour, radial histogram peak, or holecolor connected-component)
+        against the geometric evidence this redesign actually decides on:
+        containment + concentricity with the coarse ROI (geometric_-
+        plausibility), visible boundary coverage % (edge_support_fraction,
+        the partial-boundary tolerance), and fit residual where that
+        concept applies. Candidates that fail any of these are recorded in
+        `rejected` with a specific reason for the debug overlay, never
+        silently dropped. Color/background similarity is NOT checked here -
+        see the soft color_confidence annotation added after this filtering
+        step, which never gates acceptance.
+        """
+        ellipse = cand['ellipse']
+        diam_px = cand['diam_px']
+        diameter_mm = diam_px / PX_PER_MM_OUT
+        coverage = edge_support_fraction(union_edge_dist, ellipse, union_shape)
+        plausible, geo_info = geometric_plausibility(diam_px, cand['center'], outer_ring_hint)
+        cand = dict(cand)
+        cand['coverage'] = coverage
+        cand['geo_info'] = geo_info
+
+        if not plausible:
+            rejected.append((name, diameter_mm, cand, geo_info.get("reason", "NOT_PLAUSIBLE")))
+            return
+        if coverage < MIN_ACCEPT_COVERAGE:
+            rejected.append((name, diameter_mm, cand, "LOW_BOUNDARY_COVERAGE"))
+            return
+        residual = cand.get('residual')
+        if residual is not None and residual > MAX_FIT_RESIDUAL:
+            rejected.append((name, diameter_mm, cand, "HIGH_FIT_RESIDUAL"))
+            return
+
+        diam_candidates.append((name, diameter_mm, cand))
+        if os.environ.get("RING_DEBUG"):
+            print(f"[RING_DEBUG] candidate fam={name:<16} diam={diameter_mm:7.2f}mm "
+                  f"coverage={coverage:.2f} residual={residual}")
+
+    # Source 1: contour/ellipse-fit candidates per segmentation variant -
+    # EVERY plausible one, not a single pre-selected "best", per point 1 of
+    # the redesign ("detect multiple closed contour / ellipse candidates").
+    # Which one (if any) is trustworthy is now decided entirely by consider()
+    # above, not by requiring this contour to already have a separately-
+    # detected concentric outer partner in the same edge map.
+    for name, edge_map, all_cands in per_variant_all_cands:
+        for cand in all_cands:
+            consider(name, cand)
+
+    # Source 2: radial-histogram peaks - kept as a supplementary hypothesis
+    # source for every variant (not only when the contour path found
+    # nothing), since a real reflective/textured ring can have its true
+    # boundary show up more clearly as a radial peak than as any one clean
+    # contour. geometric_plausibility + coverage filtering above decide
+    # whether any of these are actually worth keeping.
+    if outer_ring_hint is not None:
+        outer_cx, outer_cy, outer_radius = outer_ring_hint
+        for name, edge_map, _all_cands in per_variant_all_cands:
             radial_cands = radial_multi_peak_candidates(
-                rect_gray,
-                edge_map,
-                (outer_cx, outer_cy),
-                outer_radius
+                rect_gray, edge_map, (outer_cx, outer_cy), outer_radius
             )
             for rc in radial_cands:
-                (cx,cy),(MA,ma),angle = rc['ellipse']
-                diameter_mm = (MA+ma)/2/PX_PER_MM_OUT
-                diam_candidates.append((name, diameter_mm, rc))
-            continue
+                consider(name, rc)
 
-        if cand is None:
-            continue
-        (cx,cy),(MA,ma),angle = cand['ellipse']
-        diameter_mm = (MA+ma)/2/PX_PER_MM_OUT
-        diam_candidates.append((name, diameter_mm, cand))
-
-    # A DIRECT hole-region detector, independent of every edge/contour
-    # method above: segments this photo's own background color within the
-    # localized ROI and looks for background-colored islands fully
-    # enclosed by non-background material - see enclosed_hole_candidates'
-    # docstring. Added as its own family ("holecolor") into the same pool,
-    # not a replacement for the others - cross-family agreement still
-    # requires >=2 independent methods, and this is one vote among them,
-    # not a trusted oracle by itself.
+    # Source 3: the direct hole-region ("holecolor") detector - still one
+    # more independent candidate family in the same pool, per point 4 of
+    # the redesign ("color/background similarity only a weak supporting
+    # feature, not a hard gate") - it contributes votes exactly like any
+    # edge-based family, but is no longer REQUIRED for any cluster to
+    # qualify (see has_topological_confirmation's removal below).
     for hc in enclosed_hole_candidates(rect_lab, marker_rect, outer_ring_hint, bg_ref):
-        (cx,cy),(MA,ma),angle = hc['ellipse']
-        diameter_mm = (MA+ma)/2/PX_PER_MM_OUT
-        diam_candidates.append((hc['name'], diameter_mm, hc))
+        consider(hc['name'], hc)
 
-    # --- THE material-contrast gate: reject candidates before they ever ---
-    # --- reach cross-method voting, not after.                          ---
-    #
-    # This is the actual fix for "low cross-method spread producing false
-    # confidence because multiple methods can agree on the same wrong
-    # edge": that failure mode is only possible if the outer edge, a
-    # bevel, a specular reflection, or a cast shadow is allowed to reach
-    # the consensus stage as a candidate at all. validate_material_contrast
-    # checks each candidate against THIS PHOTO's own sampled background -
-    # never against a known diameter or any other photo's numbers - and
-    # candidates that fail are recorded (not silently dropped) in
-    # res.rejected_candidates for the debug overlay, then excluded from
-    # every step below. Agreement between two methods that both failed
-    # this gate is no longer possible, because neither reaches the pool
-    # agreement is computed over.
-    validated = []
-    rejected = []
-    for name, diameter_mm, cand in diam_candidates:
-        passed, info = validate_material_contrast(rect_lab, cand['ellipse'], bg_ref)
-        if passed:
-            validated.append((name, diameter_mm, cand))
-        else:
-            rejected.append((name, diameter_mm, cand, info.get("reason", "MATERIAL_CONTRAST_FAILED")))
-            if os.environ.get("RING_DEBUG"):
-                print(f"[RING_DEBUG] REJECTED fam={name:<16} diam={diameter_mm:7.2f}mm "
-                      f"reason={info.get('reason')} d_in={info.get('d_in')} d_out={info.get('d_out')}")
-    diam_candidates = validated
     res.rejected_candidates = rejected
+
+    # Color/background similarity as a WEAK, NON-BLOCKING secondary cue per
+    # point 4 of the redesign: every candidate that already passed the
+    # geometric filtering above gets an additional, purely informational
+    # color_confidence annotation (1.0 = looks like an actual hole against
+    # this photo's own sampled background, 0.4 = doesn't, 0.5 = no
+    # trustworthy background sample to judge by at all). This NEVER removes
+    # a candidate - it is only used below to break ties between more than
+    # one otherwise-equally-good cluster, and to report an honest
+    # "confidence" alongside the final answer.
+    for i, (name, diameter_mm, cand) in enumerate(diam_candidates):
+        if bg_ref is not None:
+            passed_color, color_info = validate_material_contrast(rect_lab, cand['ellipse'], bg_ref)
+            cand['color_confidence'] = 1.0 if passed_color else 0.4
+            cand['color_info'] = color_info
+        else:
+            cand['color_confidence'] = 0.5
+            cand['color_info'] = None
+        diam_candidates[i] = (name, diameter_mm, cand)
 
     def draw_debug(final_ellipse=None):
         """
         Built and returned only once the outcome is known, so the overlay
         always matches what was actually decided (not a snapshot from
         mid-computation). Always draws the localization ROI and every
-        candidate that survived the material-contrast gate; additionally
-        draws REJECTED candidates (dashed, labeled with their rejection
-        reason) when RING_DEBUG_OVERLAY is set, since that view is
-        verbose/technical and not meant for the default end-user image.
-        The final selected boundary (if any) is drawn last, bold, on top.
+        candidate that survived geometric filtering; additionally draws
+        REJECTED candidates (labeled with their rejection reason) when
+        RING_DEBUG_OVERLAY is set, since that view is verbose/technical and
+        not meant for the default end-user image. The final selected
+        boundary (if any) is drawn last, bold, on top.
         """
         dbg = rectified.copy()
         line_thickness = max(3, dbg.shape[1] // 300)
@@ -1421,7 +1609,9 @@ def measure_ring(photo, verbose_name=""):
                 overlay = dbg.copy()
                 cv2.ellipse(overlay, cand['ellipse'], (0, 0, 180), max(1, line_thickness // 2))
                 dbg = cv2.addWeighted(overlay, 0.6, dbg, 0.4, 0)
-                label = f"{name}: {diameter_mm:.1f}mm REJECTED {reason}"
+                cov = cand.get('coverage')
+                cov_str = f"cov={cov:.2f}" if cov is not None else ""
+                label = f"{name}: {diameter_mm:.1f}mm REJECTED {reason} {cov_str}"
                 text_y = max(15, int(rcy - rMA / 2) - 6)
                 cv2.putText(dbg, label, (max(0, int(rcx - rMA / 2)), text_y),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 180), 1, cv2.LINE_AA)
@@ -1477,7 +1667,7 @@ def measure_ring(photo, verbose_name=""):
     # genuinely-different-object case.
     CENTER_AGREEMENT_THRESHOLD_MM = 2.0
 
-    tagged = []  # (family, diameter_mm, cx, cy, peak_rank, ellipse)
+    tagged = []  # (family, diameter_mm, cx, cy, peak_rank, ellipse, cand)
     for name, diameter_mm, cand in diam_candidates:
         family = name.split("_")[0]   # "canny_20_60" -> "canny"
         cx, cy = cand['center']
@@ -1485,7 +1675,7 @@ def measure_ring(photo, verbose_name=""):
         # is no "2nd-best contour"), so treat them as rank 0 - the same
         # standing as a variant's own strongest radial peak.
         peak_rank = cand.get('peak_rank', 0)
-        tagged.append((family, diameter_mm, cx, cy, peak_rank, cand['ellipse']))
+        tagged.append((family, diameter_mm, cx, cy, peak_rank, cand['ellipse'], cand))
 
     if os.environ.get("RING_DEBUG"):
         for t in sorted(tagged, key=lambda x: x[1]):
@@ -1538,28 +1728,20 @@ def measure_ring(photo, verbose_name=""):
         fams = families_in(cluster)
         return all(any(c[0] == fam and c[4] == 0 for c in cluster) for fam in fams)
 
-    # EDGE_FAMILIES (canny/adaptive/otsu, and the radial fallback, which
-    # inherits its originating variant's family name) are all, at bottom,
-    # gradient/edge-based methods derived from the same grayscale image -
-    # this file already documents them failing together in the same
-    # direction (the dilate-bias bug: all 4 canny variants wrong the same
-    # way at once). Two members of that group agreeing is therefore not
-    # independent confirmation - it can be the same underlying mistake
-    # counted twice. "holecolor" (enclosed_hole_candidates) is a genuinely
-    # different KIND of evidence: connected-component color topology, not
-    # gradients - so ACCEPT now requires the topological detector and at
-    # least one edge-based family to agree in the same cluster, not just
-    # any two families. A cluster made only of e.g. canny+adaptive, however
-    # tight, no longer qualifies on its own.
-    EDGE_FAMILIES = {"canny", "adaptive", "otsu"}
-
-    def has_topological_confirmation(cluster):
-        fams = families_in(cluster)
-        return "holecolor" in fams and len(fams & EDGE_FAMILIES) >= 1
-
+    # GEOMETRY-PRIMARY REVISION: a mandatory "holecolor + >=1 edge family"
+    # requirement (has_topological_confirmation) used to sit here. Removed
+    # per explicit instruction - color/background similarity is now a weak
+    # supporting cue (see the color_confidence annotation above and the
+    # tie-breaking in cluster_key below), never a requirement for a cluster
+    # to qualify. Cross-FAMILY agreement (>=2 distinct families, whichever
+    # they are - edge-based or holecolor) combined with each family's own
+    # top pick (has_a_top_peak) and, for every surviving candidate, the
+    # geometric evidence already enforced in consider() above (containment,
+    # concentricity, boundary coverage, fit residual) is what now has to
+    # carry the "this is trustworthy" judgment on its own.
     qualifying = [
         c for c in clusters
-        if len(families_in(c)) >= MIN_FAMILIES and has_a_top_peak(c) and has_topological_confirmation(c)
+        if len(families_in(c)) >= MIN_FAMILIES and has_a_top_peak(c)
     ]
 
     if os.environ.get("RING_DEBUG"):
@@ -1578,14 +1760,27 @@ def measure_ring(photo, verbose_name=""):
         res.debug_img = draw_debug()
         return res
 
-    # Prefer the cluster with the most distinct families behind it; break
-    # ties by whichever is tightest (smallest spread) - both are purely
-    # geometric/statistical properties of the candidate set itself, not
-    # anything fitted to a known answer.
+    # Prefer the cluster with the most distinct families behind it (still
+    # the primary, purely structural signal: more independent methods
+    # agreeing is stronger evidence regardless of any one photo's answer).
+    # Ties are broken first by GEOMETRIC evidence (higher average boundary
+    # coverage + lower fit residual - still geometry, still primary), and
+    # only after that by color_confidence, per the explicit instruction
+    # that color/background similarity is a weak secondary cue, not a
+    # primary ranking signal - it only ever matters when geometry alone
+    # left more than one cluster tied. Final tie-break is spread
+    # (tightest group wins). None of these are fitted to any known answer.
     def cluster_key(c):
         diams = [x[1] for x in c]
         spread = max(diams) - min(diams)
-        return (-len(families_in(c)), spread)
+        coverages = [m[6].get('coverage', 0.0) for m in c]
+        residuals = [m[6].get('residual') for m in c if m[6].get('residual') is not None]
+        avg_coverage = float(np.mean(coverages)) if coverages else 0.0
+        avg_residual = float(np.mean(residuals)) if residuals else 0.0
+        colors = [m[6].get('color_confidence', 0.5) for m in c]
+        avg_color = float(np.mean(colors)) if colors else 0.5
+        geometric_quality = avg_coverage - avg_residual  # higher coverage, lower residual = better
+        return (-len(families_in(c)), -geometric_quality, -avg_color, spread)
 
     best_cluster = min(qualifying, key=cluster_key)
 
@@ -1595,16 +1790,19 @@ def measure_ring(photo, verbose_name=""):
     # already documents "cross-method spread" as meaning.
     cluster_family_diams = {}
     cluster_family_centers = {}
-    for fam, dmm, cx, cy, _peak_rank, _ellipse in best_cluster:
+    for fam, dmm, cx, cy, _peak_rank, _ellipse, _cand in best_cluster:
         cluster_family_diams.setdefault(fam, []).append(dmm)
         cluster_family_centers.setdefault(fam, []).append((cx, cy))
 
-    # Representative ellipse for the debug overlay's final highlight only -
-    # doesn't affect the reported diameter (still the per-family median
-    # below). Prefer a member that was its own method's top pick.
+    # Representative ellipse for the debug overlay's final highlight, and
+    # for the "selected inner boundary / fitted ellipse / coverage % / fit
+    # residual" reporting fields below - doesn't affect the reported
+    # diameter (still the per-family median below). Prefer a member that
+    # was its own method's top pick.
     _top_rank_members = [m for m in best_cluster if m[4] == 0]
     _rep_member = _top_rank_members[0] if _top_rank_members else best_cluster[0]
     winning_ellipse = _rep_member[5]
+    _rep_cand = _rep_member[6]
 
     family_estimates_in_cluster = {
         fam: float(np.median(vals)) for fam, vals in cluster_family_diams.items()
@@ -1645,5 +1843,8 @@ def measure_ring(photo, verbose_name=""):
     res.ok = True
     res.diameter_mm = median
     res.detection_spread_mm = max(spread, 0.05)  # floor so we never claim impossible precision
+    res.boundary_coverage = _rep_cand.get('coverage')
+    res.fit_residual = _rep_cand.get('residual')
+    res.color_confidence = _rep_cand.get('color_confidence')
     res.debug_img = draw_debug(final_ellipse=winning_ellipse)
     return res
