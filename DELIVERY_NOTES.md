@@ -131,8 +131,9 @@ Full pass/fail table, from the delivered code, `python3 backend/regression_suite
 
 | Test case | Ground truth | Ground truth method | Expected result | Actual result | Abs. error |
 |---|---|---|---|---|---|
-| Real ring A (steel ring, mild angle) | ~17mm | ruler (coarse) | ACCEPT | ACCEPT, 16.80mm | not precisely scoreable — ruler too coarse for sub-mm ground truth |
-| Real ring B (keyring-style ring) | 27.00mm | ruler | ACCEPT | ACCEPT, 26.47mm | 0.53mm |
+| Real ring A (steel ring, mild angle) | ~17mm | ruler (coarse) | ACCEPT | ACCEPT, 17.07mm | not precisely scoreable — ruler too coarse for sub-mm ground truth |
+| Real ring B (keyring-style ring) | 27.00mm | ruler | ACCEPT | ACCEPT, 26.63mm | 0.37mm |
+| Real ring B, downscaled ~2.06x (same ring/photo, resolution reduced to match a real problem upload) | 27.00mm (same ring as above) | ruler (same measurement, reused) | **REJECT** | REJECT — `RESOLUTION_TOO_LOW` | n/a — correctly refuses at a resolution below what detection is validated for, instead of guessing |
 | Synthetic clean baseline | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.36mm | 0.04mm |
 | Synthetic specular highlight | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.40mm | 0.00mm |
 | Synthetic shadow gradient | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.36mm | 0.04mm |
@@ -142,9 +143,30 @@ Full pass/fail table, from the delivered code, `python3 backend/regression_suite
 | Synthetic wide scene (ring small in frame) | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.57mm | 0.17mm |
 | Synthetic decoy object (adversarial second circle) | 17.40mm | rendered (exact) | ACCEPT (ignore decoy) | ACCEPT, 17.53mm | 0.13mm |
 
-**10/10 pass** against `test_set/expected_vs_actual.csv` at delivery time.
+**11/11 pass** against `test_set/expected_vs_actual.csv` at delivery time.
 Every rejected case rejects for the reason the test was designed to
 trigger, not an unrelated failure.
+
+**Detection architecture (current):** for each of the 6 segmentation
+variants (4 Canny threshold pairs, adaptive threshold, Otsu), the primary
+closed-contour detector runs first; if it can't get a clean inner+outer
+contour pair, a radial-histogram fallback (gradient-direction-filtered
+edge pixels binned by radius around an independently Hough-validated
+outer circle) now returns *every* genuine local peak in its histogram,
+not just the single tallest one, each tagged with its own rank. All
+candidates from all variants — contour-based and radial — are pooled,
+collapsed to one family each (canny/adaptive/otsu, since the 4 Canny
+variants are correlated), then grouped by proximity (1mm chaining) across
+families. A group only counts as genuine cross-method agreement, and can
+only be accepted, if it has candidates from at least 2 distinct families
+*and* every family in the group is represented by its own top-ranked
+peak — not a weak secondary peak that happens to land nearby. Groups that
+clear that bar must also agree spatially (family centroids within 2mm of
+each other in real space), which catches two methods finding two
+different round things rather than the same hole. This replaced an
+earlier design that collapsed each family down to one value *before*
+checking agreement, which could throw away a method's genuinely-correct
+candidate if its own single best guess happened to be wrong.
 
 ### Observed failures and limitations
 
@@ -161,18 +183,31 @@ trigger, not an unrelated failure.
   useful for stress-testing specific failure modes (exactly what the
   eight synthetic cases above do) but do not substitute for real, unseen
   rings when the claim being tested is generalization.
-- **Resolution sensitivity (real, reproduced, not yet fixed):** the
-  detection thresholds are calibrated against full-resolution phone
-  photos (~3000×4000px). Taking the already-passing Real ring B photo and
-  simply downscaling it by ~2x (to ~1466×1956px, no other change)
-  reproduces a failure (`RING_EDGE_UNSTABLE`) on the exact same ring. Any
-  upload path that compresses/resizes a photo before it reaches the
-  backend can trigger this. Diagnostic logging of received photo
-  dimensions was added (`backend/main.py`) to catch this in production,
-  but a resolution-independent fix has not been shipped — see the
-  in-code comments on `radial_gradient_scan_candidate` and the two
-  reverted fix attempts in git history for what was tried and why it was
-  rejected rather than shipped as a false accept.
+- **Resolution sensitivity (real, reproduced — now gated, not fixed at
+  the root):** the detection thresholds are calibrated against
+  full-resolution phone photos (marker ~427-437px on a side in the
+  original upload, on both real validated photos). Taking the
+  already-passing Real ring B photo and simply downscaling it by ~2x (to
+  a ~207px marker) reproduces a failure on the exact same ring — and
+  while building the current multi-peak/cross-family-consensus
+  architecture, an intermediate version of it turned that failure from an
+  honest rejection into a **confident but wrong** 23.4mm accept (spread
+  only 0.13mm) against the real 27mm, before the "every family must
+  agree via its own top peak" requirement and a dedicated resolution gate
+  were added (see `pipeline.py`'s `detect_and_rectify`,
+  `RESOLUTION_TOO_LOW`). That gate checks marker pixel density in the
+  *original* upload — a property knowable before any ring detection runs,
+  independent of any specific photo's diameter — and rejects early if
+  it's below a conservative floor (300px, roughly midway between the
+  validated ~430px photos and the proven-bad ~207px case) rather than
+  letting miscalibrated pixel-domain thresholds produce an unreliable
+  number. This is a gate, not a fix to the underlying cause: the
+  Canny/gradient thresholds themselves are still only validated at
+  full resolution, and the 300px floor is provisional, chosen from two
+  data points' worth of margin, not a statistically derived cutoff.
+  Revisit once more real low-resolution photos are available. Diagnostic
+  logging of received photo dimensions remains in `backend/main.py` to
+  keep visibility into what resolutions real uploads actually arrive at.
 - **Reflective/metal rings are the hardest case.** The primary
   closed-contour detector often can't get a clean boundary on a
   reflective ring at all (0 of 6 segmentation variants produced a closed
@@ -278,3 +313,29 @@ worse failure mode for a measurement tool than refusing to guess — see
 git history (`3e07ad8` then reverted by `0767fc5`) for the full record,
 including the diagnostic evidence (radius histograms with no genuine peak
 near the true boundary) that showed *why* the fix only appeared to work.
+
+A third example, from building the current multi-peak/cross-family
+architecture itself: the new design (every method contributes multiple
+ranked candidate peaks, not just its single best) was built and verified
+against `regression_suite.py` — 10/10 pass, with both real photos'
+error improving (17.07mm vs ~17mm, and 26.63mm vs 27mm at 0.37mm error,
+down from 0.53mm) — *before* its output was checked against anything
+outside that suite, per this project's own ground-truth-leakage policy.
+Only after that pass was it tested against the downscaled Real-ring-B
+photo described above, and it returned a confident 23.4mm (0.13mm spread)
+against the real 27mm — a new instance of the exact failure mode the
+project had already flagged as unacceptable. Root cause, found by
+printing each family's tagged candidates: two methods' own weaker,
+lower-ranked peaks (not either method's own top pick) had coincidentally
+landed within 0.27mm of each other, which the initial "at least one
+member must be a top peak" safeguard didn't catch because it only
+required *one* family in the group to be its own top pick, not all of
+them. Tightening that to "every family in the group must be represented
+by its own top-ranked peak" removed the false accept without changing
+either real photo's result, confirmed by rerunning the full suite (still
+10/10) and the downscaled photo directly. The remaining single
+qualifying candidate for that photo (36.0mm, essentially the outer ring
+itself) was still implausible, which is what motivated the separate,
+pre-detection `RESOLUTION_TOO_LOW` gate described above — added and then
+added as its own regression case (`real_ring_B_downscaled`, now 11/11)
+rather than trusted on the strength of one manual check.

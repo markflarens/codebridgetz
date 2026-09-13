@@ -32,6 +32,7 @@ test photo it is or what its known diameter is. Concretely:
   ambiguous to trust, should return a specific retake reason - never an
   unreliable number dressed up as a confident one.
 """
+import os
 import cv2
 import numpy as np
 
@@ -117,6 +118,41 @@ def detect_and_rectify(photo):
     avg_side_px = (top+bottom+left+right) / 4
     if avg_side_px < 80:
         return None, None, "MARKER_TOO_SMALL"
+
+    # Effective resolution check, distinct from MARKER_TOO_SMALL above.
+    #
+    # MARKER_TOO_SMALL (80px) is a floor for ArUco CORNER localization
+    # staying numerically sane - below it, corner-finding itself gets
+    # noisy. This is a separate, higher floor for whether there are enough
+    # real source pixels per mm for the pixel-domain edge/gradient
+    # thresholds in the rest of this file (Canny thresholds, gradient-angle
+    # tolerance, histogram prominence/support cutoffs) to behave the way
+    # they were calibrated to. Those thresholds were tuned against the two
+    # real validated photos, both ~427-437px marker side (see
+    # MARKER_TOO_SMALL's comment above and main.py's load_image_any_format
+    # docstring on why a downscale-before-processing shortcut was tried and
+    # reverted). Proven concretely: downscaling one of those same validated
+    # photos by ~2x (to ~207px marker side, same physical ring, same
+    # marker) reproduces a failure the full-resolution original never had -
+    # not by becoming blurry (blur_score() above, checked on the original
+    # upload, does not catch this - downscaling reduces spatial detail
+    # without necessarily lowering Laplacian variance at the new, smaller
+    # pixel grid) but by starving the pixel-domain thresholds of the detail
+    # they need, which can let independent methods agree on the wrong
+    # boundary with a deceptively TIGHT spread (high false confidence,
+    # worse than an honest rejection).
+    #
+    # 300px is a provisional, conservative cut roughly midway between the
+    # validated photos (~427-437px) and the proven-bad case (~207px) - not
+    # fitted to any specific photo's diameter or ground truth, only to
+    # marker pixel density, which is knowable before any ring detection
+    # happens at all. Revisit (probably raise, with more headroom) once
+    # more real photos across a range of phone cameras/resolutions are
+    # available - this is deliberately a resolution/calibration-validity
+    # gate, not a per-photo special case.
+    MIN_MARKER_PX_FOR_CALIBRATED_THRESHOLDS = 300
+    if avg_side_px < MIN_MARKER_PX_FOR_CALIBRATED_THRESHOLDS:
+        return None, None, "RESOLUTION_TOO_LOW"
 
     side_ratio = max(top,bottom,left,right) / max(1e-6, min(top,bottom,left,right))
     # Tightened from an earlier 1.8: that threshold was never empirically
@@ -323,40 +359,31 @@ def inner_boundary_from_candidates(candidates, quality_floor=0.5,
     return None  # no candidate had a matching ring-band partner - don't guess
 
 
-def radial_inner_candidate(gray_for_gradient, edge_map, center, outer_radius_px,
-                           min_band_ratio=1.07,
-                           max_band_ratio=1.8,
-                           min_support=0.03,
-                           min_prominence=1.25,
-                           gradient_angle_tolerance_deg=20):
+def _radial_edge_histogram(gray_for_gradient, edge_map, center, outer_radius_px,
+                            min_band_ratio, max_band_ratio,
+                            gradient_angle_tolerance_deg):
     """
-    Fallback for real metal rings where reflections/shadows break the
-    boundary into arcs and findContours() cannot produce a clean closed
-    contour.
+    Shared setup for the radial fallback: build a histogram of
+    radially-oriented edge-pixel counts by radius, in the plausible
+    inner-boundary band [r_min, r_max] below outer_radius_px.
 
     CRITICAL FIX (found on a real photo of a ring on a wood table):
     counting ALL edge pixels in the radius band, regardless of direction,
     fails on textured backgrounds. Wood grain alone produced 300-478 Canny
     edge pixels at EVERY radius from 122-202px in one real test photo - an
-    almost flat, noisy histogram with no usable peak (prominence ~1.16,
-    needed >1.7 under the old thresholds). A true circular boundary's edge
-    pixels have gradients pointing RADIALLY (toward/away from the circle's
-    center); wood grain and other texture edges do not - their gradient
-    direction is set by the grain/pattern, essentially decorrelated from
-    any candidate center. Filtering edge pixels to only those whose local
-    gradient direction is within `gradient_angle_tolerance_deg` of radial,
-    before building the radius histogram, removes the vast majority of
-    texture noise and reveals the true peak (confirmed on the same photo:
-    filtered peak landed within ~0.2mm of the ~27mm ground truth, versus a
-    wrong-by-8mm peak on the unfiltered histogram). Thresholds below are
-    recalibrated for the filtered (much lower absolute count, much
-    cleaner) histogram - they are not the same numbers that applied to an
-    unfiltered count.
+    almost flat, noisy histogram with no usable peak. A true circular
+    boundary's edge pixels have gradients pointing RADIALLY (toward/away
+    from the circle's center); wood grain and other texture edges do not -
+    their gradient direction is set by the grain/pattern, essentially
+    decorrelated from any candidate center. Filtering edge pixels to only
+    those whose local gradient direction is within
+    `gradient_angle_tolerance_deg` of radial, before building the radius
+    histogram, removes the vast majority of texture noise and reveals the
+    true peak.
 
-    The candidate must:
-    - be plausibly inside the outer ring edge;
-    - have enough angular edge support (of radially-oriented edges only);
-    - form a clear radial peak rather than ordinary background texture.
+    Returns (hist, r_min, r_max) where hist[i] is the count at radius
+    r_min + i, or (None, r_min, r_max) if there isn't enough signal to
+    build a histogram at all.
     """
     cx, cy = center
 
@@ -364,7 +391,7 @@ def radial_inner_candidate(gray_for_gradient, edge_map, center, outer_radius_px,
     r_max = int(np.floor(outer_radius_px / min_band_ratio))
 
     if r_max <= r_min + 3:
-        return None
+        return None, r_min, r_max
 
     pad = int(np.ceil(outer_radius_px)) + 3
 
@@ -377,7 +404,7 @@ def radial_inner_candidate(gray_for_gradient, edge_map, center, outer_radius_px,
     ys, xs = np.nonzero(roi)
 
     if len(xs) < 20:
-        return None
+        return None, r_min, r_max
 
     xs = xs + x0
     ys = ys + y0
@@ -387,9 +414,8 @@ def radial_inner_candidate(gray_for_gradient, edge_map, center, outer_radius_px,
     xs, ys, radii = xs[in_band], ys[in_band], radii[in_band]
 
     if len(radii) < 20:
-        return None
+        return None, r_min, r_max
 
-    # --- Gradient-direction filter (the actual fix) ---
     gx = cv2.Sobel(gray_for_gradient, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray_for_gradient, cv2.CV_32F, 0, 1, ksize=3)
     gxs, gys = gx[ys, xs], gy[ys, xs]
@@ -402,41 +428,59 @@ def radial_inner_candidate(gray_for_gradient, edge_map, center, outer_radius_px,
     radii = radii[radial_mask]
 
     if len(radii) < 20:
-        return None
+        return None, r_min, r_max
 
     rounded = np.rint(radii).astype(np.int32)
-
-    hist = np.bincount(
-        rounded,
-        minlength=r_max + 2
-    )[r_min:r_max + 1]
+    hist = np.bincount(rounded, minlength=r_max + 2)[r_min:r_max + 1]
 
     if hist.size == 0:
+        return None, r_min, r_max
+
+    return hist, r_min, r_max
+
+
+def radial_inner_candidate(gray_for_gradient, edge_map, center, outer_radius_px,
+                           min_band_ratio=1.07,
+                           max_band_ratio=1.8,
+                           min_support=0.03,
+                           min_prominence=1.25,
+                           gradient_angle_tolerance_deg=20):
+    """
+    Single-best-peak version of the radial fallback: return only the
+    tallest peak in the radius histogram. Used by locate_outer_ring_circle()
+    to validate a Hough circle (a yes/no "does this look ring-like at all"
+    check) - that caller only ever needs one answer, and changing its
+    behavior has previously been shown to change which Hough circle gets
+    picked as the outer boundary (a real regression - see git history
+    around commits 3e07ad8 / 0767fc5), so it is kept exactly as originally
+    calibrated and NOT reused internally by the multi-candidate path below.
+
+    measure_ring() itself no longer uses this for its own final
+    measurement - see radial_multi_peak_candidates() and the "Cross-family
+    candidate consensus" section of measure_ring for why a single
+    global-argmax peak per method is not enough to trust on its own.
+    """
+    hist, r_min, r_max = _radial_edge_histogram(
+        gray_for_gradient, edge_map, center, outer_radius_px,
+        min_band_ratio, max_band_ratio, gradient_angle_tolerance_deg
+    )
+    if hist is None:
         return None
 
+    cx, cy = center
     peak_idx = int(np.argmax(hist))
     radius = float(r_min + peak_idx)
     peak = float(hist[peak_idx])
 
-    # Approximate fraction of the circumference supported by edge pixels.
     support = peak / max(1.0, 2.0 * np.pi * radius)
-
-    # Reject broad/noisy radial distributions from wood grain/background.
     baseline = float(np.percentile(hist, 75))
     prominence = peak / max(1.0, baseline)
 
-    if support < min_support:
-        return None
-
-    if prominence < min_prominence:
+    if support < min_support or prominence < min_prominence:
         return None
 
     return {
-        "ellipse": (
-            (float(cx), float(cy)),
-            (2.0 * radius, 2.0 * radius),
-            0.0
-        ),
+        "ellipse": ((float(cx), float(cy)), (2.0 * radius, 2.0 * radius), 0.0),
         "circularity": 1.0,
         "axis_ratio": 1.0,
         "residual": 0.0,
@@ -446,6 +490,90 @@ def radial_inner_candidate(gray_for_gradient, edge_map, center, outer_radius_px,
         "radial_support": support,
         "radial_prominence": prominence,
     }
+
+
+def radial_multi_peak_candidates(gray_for_gradient, edge_map, center, outer_radius_px,
+                                  min_band_ratio=1.07,
+                                  max_band_ratio=1.8,
+                                  min_support=0.03,
+                                  min_prominence=1.25,
+                                  gradient_angle_tolerance_deg=20,
+                                  max_peaks=3):
+    """
+    Multi-candidate version of the radial fallback, used for the actual
+    measurement (unlike radial_inner_candidate's single best-peak, which is
+    reserved for Hough-circle validation - see its docstring).
+
+    WHY MULTIPLE PEAKS, NOT ONE: taking only the single tallest bin
+    (argmax) throws away information whenever a photo has more than one
+    locally-strong radius - which real reflective/textured photos do
+    often, from causes that have nothing to do with the true inner
+    boundary (the outer edge's own blur/specular halo bleeding a little
+    way into the search band; an unrelated internal reflection). Picking
+    "the tallest one" per method and then only comparing those single
+    picks across methods (the old design) meant that if two different
+    methods' tallest peaks happened to be two different ARTIFACTS, cross-
+    method agreement could never rescue the truth even when the true peak
+    was sitting right there as each method's SECOND-best peak. Returning
+    every genuine local peak (not just the best) lets the caller look for
+    agreement across the full candidate set instead of just each method's
+    single guess - the true boundary only has to be a locally-strong edge
+    NOMINATED by multiple independent methods, not necessarily each
+    method's own top pick.
+
+    A "peak" here is a strict local maximum of the (already
+    gradient-direction-filtered) radius histogram - hist[i] > hist[i-1]
+    and hist[i] >= hist[i+1] - that clears the same per-candidate support/
+    prominence bar as the single-peak version. Prominence is computed
+    against the histogram's own 75th percentile as a local-noise-floor
+    baseline (same idea as before, not a value fitted to any one photo).
+    Peaks are returned ranked by prominence, capped at max_peaks so one
+    noisy method can't flood the cross-method vote with many weak entries.
+    """
+    hist, r_min, r_max = _radial_edge_histogram(
+        gray_for_gradient, edge_map, center, outer_radius_px,
+        min_band_ratio, max_band_ratio, gradient_angle_tolerance_deg
+    )
+    if hist is None:
+        return []
+
+    cx, cy = center
+    baseline = float(np.percentile(hist, 75))
+
+    peaks = []
+    n = len(hist)
+    for i in range(n):
+        v = float(hist[i])
+        if v <= 0:
+            continue
+        left_ok = (i == 0) or (v > hist[i - 1])
+        right_ok = (i == n - 1) or (v >= hist[i + 1])
+        if not (left_ok and right_ok):
+            continue
+
+        radius = float(r_min + i)
+        support = v / max(1.0, 2.0 * np.pi * radius)
+        prominence = v / max(1.0, baseline)
+        if support < min_support or prominence < min_prominence:
+            continue
+
+        peaks.append({
+            "ellipse": ((float(cx), float(cy)), (2.0 * radius, 2.0 * radius), 0.0),
+            "circularity": 1.0,
+            "axis_ratio": 1.0,
+            "residual": 0.0,
+            "score": support,
+            "diam_px": 2.0 * radius,
+            "center": (float(cx), float(cy)),
+            "radial_support": support,
+            "radial_prominence": prominence,
+        })
+
+    peaks.sort(key=lambda c: c["radial_prominence"], reverse=True)
+    peaks = peaks[:max_peaks]
+    for rank, p in enumerate(peaks):
+        p["peak_rank"] = rank  # 0 = this variant's single strongest peak
+    return peaks
 
 
 def locate_outer_ring_circle(rect_gray, marker_rect):
@@ -612,6 +740,8 @@ def measure_ring(photo, verbose_name=""):
         rect_gray,
         marker_rect
     )
+    if os.environ.get("RING_DEBUG") and outer_ring_hint is not None:
+        print(f"[RING_DEBUG] outer_ring_hint diam_mm={2*outer_ring_hint[2]/PX_PER_MM_OUT:.2f}")
 
     diam_candidates = []
     dbg = rectified.copy()
@@ -625,14 +755,30 @@ def measure_ring(photo, verbose_name=""):
         # Fallback for real reflective rings: allow a partially broken
         # inner boundary, but ONLY around a ring location that
         # independently showed outer + inner circular structure.
+        #
+        # MULTIPLE candidates per variant, not one: see
+        # radial_multi_peak_candidates' docstring for why taking only the
+        # single tallest histogram peak per method throws away exactly the
+        # information that lets independent methods rescue each other from
+        # unrelated artifacts. Every returned peak becomes its own entry in
+        # diam_candidates, same as if it were its own detection - the
+        # cross-family clustering below decides which one (if any) has
+        # genuine multi-method support.
         if cand is None and outer_ring_hint is not None:
             outer_cx, outer_cy, outer_radius = outer_ring_hint
-            cand = radial_inner_candidate(
+            radial_cands = radial_multi_peak_candidates(
                 rect_gray,
                 edge_map,
                 (outer_cx, outer_cy),
                 outer_radius
             )
+            for rc in radial_cands:
+                (cx,cy),(MA,ma),angle = rc['ellipse']
+                diameter_mm = (MA+ma)/2/PX_PER_MM_OUT
+                diam_candidates.append((name, diameter_mm, rc))
+                line_thickness = max(3, dbg.shape[1] // 300)
+                cv2.ellipse(dbg, rc['ellipse'], colors[i%len(colors)], line_thickness)
+            continue
 
         if cand is None:
             continue
@@ -652,42 +798,152 @@ def measure_ring(photo, verbose_name=""):
     res.candidates_mm = diam_candidates
     res.debug_img = dbg
 
-    # --- Aggregate by INDEPENDENT METHOD FAMILY, not raw candidate count. ---
+    # --- Cross-family candidate CONSENSUS, not per-family single-best-vote. ---
+    #
     # canny_20_60 .. canny_60_150 are the same underlying detector with only
     # a threshold changed: they are correlated and tend to succeed or fail
-    # together (we proved this with the dilate-bias bug - all 4 canny variants
-    # were wrong in the same direction at once). Counting them as "4 independent
-    # confirmations" overstates confidence. We collapse each family to a single
-    # vote (its median) before measuring cross-family agreement.
-    families = {}
+    # together (proved with the dilate-bias bug - all 4 canny variants were
+    # wrong in the same direction at once). Counting them as "4 independent
+    # confirmations" overstates confidence, so a FAMILY (canny/adaptive/
+    # otsu) is still the unit of "one independent method", exactly as
+    # before.
+    #
+    # What's different from the old design: instead of first collapsing
+    # each family down to ONE value (that family's single best/only guess)
+    # and only then checking whether those single per-family values agree,
+    # every surviving candidate from every family is pooled together and
+    # grouped by proximity FIRST. This matters because a family's own best
+    # guess can be wrong while a candidate value close to the truth still
+    # exists somewhere in its (now multi-candidate) output - collapsing too
+    # early can throw that away before cross-family agreement ever gets a
+    # chance to find it. The accepted answer is the tightest group of
+    # candidate diameters that has members from at least MIN_FAMILIES
+    # distinct families - i.e. "multiple independent methods each nominate
+    # a candidate at essentially the same physical size", which is what
+    # "these methods agree" should actually mean, rather than "each
+    # method's single top pick happens to match another method's single
+    # top pick".
+    MIN_FAMILIES = 2         # need at least 2 genuinely different methods to agree
+    CLUSTER_TOL_MM = 1.0     # same tolerance the old design used for "do family votes agree"
+    CENTER_AGREEMENT_THRESHOLD_MM = 2.0
+
+    tagged = []  # (family, diameter_mm, cx, cy, peak_rank)
     for name, diameter_mm, cand in diam_candidates:
         family = name.split("_")[0]   # "canny_20_60" -> "canny"
         cx, cy = cand['center']
-        families.setdefault(family, []).append((diameter_mm, cx, cy))
+        # Contour-based candidates are a single, direct measurement (there
+        # is no "2nd-best contour"), so treat them as rank 0 - the same
+        # standing as a variant's own strongest radial peak.
+        peak_rank = cand.get('peak_rank', 0)
+        tagged.append((family, diameter_mm, cx, cy, peak_rank))
 
-    family_estimates = {}
-    family_centers = {}
-    for fam, vals in families.items():
-        diams = [v[0] for v in vals]
-        cxs = [v[1] for v in vals]
-        cys = [v[2] for v in vals]
-        family_estimates[fam] = float(np.median(diams))
-        family_centers[fam] = (float(np.median(cxs)), float(np.median(cys)))
+    if os.environ.get("RING_DEBUG"):
+        for t in sorted(tagged, key=lambda x: x[1]):
+            print(f"[RING_DEBUG] fam={t[0]:<8} diam={t[1]:7.2f}mm center=({t[2]:.0f},{t[3]:.0f}) peak_rank={t[4]}")
 
-    res.family_estimates = family_estimates
+    all_families = {t[0] for t in tagged}
+    res.family_estimates = {
+        fam: float(np.median([t[1] for t in tagged if t[0] == fam]))
+        for fam in all_families
+    }
 
-    MIN_FAMILIES = 2   # need at least 2 genuinely different methods to agree
-    if len(family_estimates) < MIN_FAMILIES:
+    if len(all_families) < MIN_FAMILIES:
         res.reason = "RING_NOT_FOUND"
         return res
+
+    # Greedy 1D chain-clustering on diameter_mm: sorted candidates within
+    # CLUSTER_TOL_MM of their cluster's running extent join the same
+    # cluster. Simple and deterministic - no fitting to any known answer,
+    # just "how close together are these numbers".
+    tagged_sorted = sorted(tagged, key=lambda t: t[1])
+    clusters = []
+    for item in tagged_sorted:
+        if clusters and item[1] - clusters[-1][-1][1] <= CLUSTER_TOL_MM:
+            clusters[-1].append(item)
+        else:
+            clusters.append([item])
+
+    def families_in(cluster):
+        return {c[0] for c in cluster}
+
+    def has_a_top_peak(cluster):
+        # Require EVERY distinct family contributing to this cluster to be
+        # represented there by its OWN strongest signal (rank 0) - not just
+        # one family's top pick plus another family's weak/low-ranked
+        # secondary peak that happens to land nearby. Checked and tightened
+        # after finding a concrete counter-example: an earlier version of
+        # this check required only ANY member to be rank 0, which let a
+        # cluster through where one family's top pick (rank 0) coincided
+        # with a SECOND family's 2nd-choice peak (rank 1) - a materially
+        # weaker form of agreement than "two methods each independently
+        # nominate this as their own best answer". On a test photo this
+        # produced a confidently wrong, deceptively tight-spread result
+        # while a different cluster - where every contributing family's own
+        # top pick agreed - was the one actually consistent with the known
+        # answer. Requiring full top-pick agreement across every family in
+        # the cluster (not just one) is still a purely structural,
+        # photo-agnostic property of the candidate set, not a value fitted
+        # to that photo's own numbers.
+        fams = families_in(cluster)
+        return all(any(c[0] == fam and c[4] == 0 for c in cluster) for fam in fams)
+
+    qualifying = [
+        c for c in clusters
+        if len(families_in(c)) >= MIN_FAMILIES and has_a_top_peak(c)
+    ]
+
+    if os.environ.get("RING_DEBUG"):
+        print(f"[RING_DEBUG] {len(qualifying)} qualifying cluster(s):")
+        for c in qualifying:
+            diams = [x[1] for x in c]
+            print(f"[RING_DEBUG]   range=[{min(diams):.2f},{max(diams):.2f}] families={families_in(c)}")
+
+    if not qualifying:
+        # Enough independent methods produced SOMETHING, but no group of
+        # candidates from different methods landed close together - the
+        # methods never actually agreed on a single boundary.
+        res.reason = "RING_EDGE_UNSTABLE"
+        fam_values = np.array(list(res.family_estimates.values()))
+        res.detection_spread_mm = float(fam_values.max() - fam_values.min())
+        return res
+
+    # Prefer the cluster with the most distinct families behind it; break
+    # ties by whichever is tightest (smallest spread) - both are purely
+    # geometric/statistical properties of the candidate set itself, not
+    # anything fitted to a known answer.
+    def cluster_key(c):
+        diams = [x[1] for x in c]
+        spread = max(diams) - min(diams)
+        return (-len(families_in(c)), spread)
+
+    best_cluster = min(qualifying, key=cluster_key)
+
+    # Per-family representative value WITHIN the winning cluster (median,
+    # in case a family contributed more than one peak to it) - this keeps
+    # the same "one vote per family" semantics the rest of the app/UI
+    # already documents "cross-method spread" as meaning.
+    cluster_family_diams = {}
+    cluster_family_centers = {}
+    for fam, dmm, cx, cy, _peak_rank in best_cluster:
+        cluster_family_diams.setdefault(fam, []).append(dmm)
+        cluster_family_centers.setdefault(fam, []).append((cx, cy))
+
+    family_estimates_in_cluster = {
+        fam: float(np.median(vals)) for fam, vals in cluster_family_diams.items()
+    }
+    family_centers_in_cluster = {
+        fam: (float(np.median([c[0] for c in vals])), float(np.median([c[1] for c in vals])))
+        for fam, vals in cluster_family_centers.items()
+    }
 
     # --- Spatial consensus: families must agree on WHERE, not just diameter. ---
     # Comparing diameters alone can't tell "two methods found the same hole"
     # from "two methods found two different circular things in the scene"
     # (a reflection here, a background pattern there) that happen to be
-    # similar sizes. Require the family centroids to be close together, in
-    # the same physical units (mm) as everything else we report.
-    centers_mm = {fam: (x/PX_PER_MM_OUT, y/PX_PER_MM_OUT) for fam,(x,y) in family_centers.items()}
+    # similar sizes. Require the family centroids (within the winning
+    # cluster) to be close together, in the same physical units (mm) as
+    # everything else we report.
+    centers_mm = {fam: (x/PX_PER_MM_OUT, y/PX_PER_MM_OUT) for fam,(x,y) in family_centers_in_cluster.items()}
     fams = list(centers_mm.keys())
     max_center_dist_mm = 0.0
     for i in range(len(fams)):
@@ -696,7 +952,6 @@ def measure_ring(photo, verbose_name=""):
             dist = np.hypot(x1-x2, y1-y2)
             max_center_dist_mm = max(max_center_dist_mm, dist)
 
-    CENTER_AGREEMENT_THRESHOLD_MM = 2.0
     if max_center_dist_mm > CENTER_AGREEMENT_THRESHOLD_MM:
         # families found geometrically DIFFERENT objects, not the same hole
         # measured slightly differently - this is a distinct failure mode
@@ -704,19 +959,9 @@ def measure_ring(photo, verbose_name=""):
         res.reason = "INCONSISTENT_DETECTION"
         return res
 
-    fam_values = np.array(list(family_estimates.values()))
-    spread = fam_values.max() - fam_values.min()
+    fam_values = np.array(list(family_estimates_in_cluster.values()))
+    spread = float(fam_values.max() - fam_values.min())
     median = float(np.median(fam_values))
-
-    if spread > 1.0:   # mm -- families disagree too much, unreliable
-        res.reason = "RING_EDGE_UNSTABLE"
-        # Deliberately NOT setting res.diameter_mm here even though we have
-        # a median value: res.ok is False, and a number sitting on a
-        # "not ok" result is a landmine for any future code path that reads
-        # diameter_mm without checking ok first. detection_spread_mm is
-        # still useful to keep for diagnostics (it's WHY this was rejected).
-        res.detection_spread_mm = spread
-        return res
 
     res.ok = True
     res.diameter_mm = median

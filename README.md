@@ -94,8 +94,8 @@ measured against this pipeline:
 
 | Photo | Caliper/ruler ground truth | Pipeline result | Abs. error |
 |---|---|---|---|
-| IMG_9783 (steel ring, mild angle) | ~17mm (ruler, coarse) | 16.80mm | — (ruler too coarse to score precisely) |
-| IMG_9784 (keyring-style ring) | 27mm (ruler) | 26.47mm | 0.53mm |
+| IMG_9783 (steel ring, mild angle) | ~17mm (ruler, coarse) | 17.07mm | — (ruler too coarse to score precisely) |
+| IMG_9784 (keyring-style ring) | 27mm (ruler) | 26.63mm | 0.37mm |
 
 Six synthetic stress photos (clean, specular highlight, shadow gradient,
 low contrast, textured background, heavy blur) and one adversarial decoy
@@ -115,9 +115,16 @@ during development — see delivery notes for the full pass/fail table.
   same shortcut.
 - The Hough/radial fallback (used when the primary closed-contour detector
   can't get a clean boundary, e.g. on reflective metal) is coarser than
-  the primary path: cross-method spread on real photos was 0.67-0.80mm,
+  the primary path: cross-method spread on real photos was 0.37-0.8mm,
   versus ~0.05mm on clean synthetic renders. Report this honestly; don't
   let the UI imply lab-grade precision it hasn't earned.
+- Detection thresholds are only validated at full phone-camera resolution
+  (marker ~430px on a side in the original upload). A photo uploaded at
+  roughly half that pixel density is rejected with `RESOLUTION_TOO_LOW`
+  rather than measured — see `pipeline.py`'s `detect_and_rectify` and
+  DELIVERY_NOTES.md for how this was found (a downscaled copy of an
+  already-passing real photo produced a confident wrong answer before
+  this gate existed).
 - Ring size lookup only covers the standard US 3-13.5 adult finger-ring
   range; a measured diameter outside that (e.g. a keyring) is flagged via
   `ring_size_in_range: false` rather than forcing a nonsense size.

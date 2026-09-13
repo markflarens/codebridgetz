@@ -54,6 +54,24 @@ TEST_SET_DIR = os.path.normpath(os.path.join(_HERE, "..", "test_set"))
 CASES = [
     ("real_ring_A_9783",        "real_ring_A_IMG_9783.jpg",             "ACCEPT", None,  None),
     ("real_ring_B_9784",        "real_ring_B_IMG_9784.jpg",             "ACCEPT", 27.0,  1.0),
+    # NOT a new/unseen ring - this is the SAME photo as real_ring_B_9784
+    # above, downscaled ~2.06x (3024x4032 -> 1466x1956, matching a real
+    # user-uploaded photo's resolution) before being saved. Added as an
+    # honestly-labeled regression case after this exact file was proven to
+    # reproduce a real failure: the pre-multi-peak pipeline rejected it
+    # (RING_EDGE_UNSTABLE, an honest miss); an intermediate version of the
+    # multi-peak/cross-family-consensus rework instead ACCEPTED it at a
+    # confident-looking but wrong 23.4mm (detection_spread 0.13mm) against
+    # this ring's real 27mm - a regression from "honestly unsure" to
+    # "confidently wrong" that a diameter-blind test (this one expects
+    # REJECT, not a specific wrong number) is specifically designed to
+    # catch. Do not "fix" this case by tuning candidate selection toward
+    # 27mm - the point is that this resolution is outside what this
+    # pipeline's pixel-domain thresholds are validated for (see
+    # RESOLUTION_TOO_LOW in pipeline.py's detect_and_rectify), so an honest
+    # retake is the correct, generalizable answer - not a correct-looking
+    # guess.
+    ("real_ring_B_downscaled",  "real_ring_B_downscaled_2x_resolution_check.png", "REJECT", None, None),
     ("synth_clean_baseline",    "synth_clean_baseline.png",             "ACCEPT", 17.40, 0.3),
     ("synth_specular",          "synth_specular_highlight.png",         "ACCEPT", 17.40, 0.3),
     ("synth_shadow_gradient",   "synth_shadow_gradient.png",            "ACCEPT", 17.40, 0.3),

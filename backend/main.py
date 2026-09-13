@@ -44,6 +44,7 @@ RETAKE_MESSAGES = {
     "MARKER_NOT_FOUND": "Marker not detected. Make sure the whole marker is flat, unobstructed, and in the photo.",
     "MARKER_PARTIAL": "Marker is not fully visible. Keep the entire marker inside the frame.",
     "MARKER_TOO_SMALL": "Marker appears too small in the photo. Move the camera closer to the ring and marker.",
+    "RESOLUTION_TOO_LOW": "Photo resolution is too low relative to the marker's size in frame for a reliable measurement. Retake at the camera's normal/full resolution (avoid pre-shrunk or heavily compressed images), or move closer so the marker fills more of the frame.",
     "PERSPECTIVE_TOO_HIGH": "Too much perspective. Take the photo more directly from above.",
     "BLUR": "Photo is too blurry. Hold the phone steady and retake.",
     "UNDEREXPOSED": "Photo is too dark. Move to a brighter area and retake.",
