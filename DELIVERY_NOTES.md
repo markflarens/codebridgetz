@@ -132,7 +132,7 @@ Full pass/fail table, from the delivered code, `python3 backend/regression_suite
 | Test case | Ground truth | Ground truth method | Expected result | Actual result | Abs. error |
 |---|---|---|---|---|---|
 | Real ring A (steel ring, mild angle) | ~17mm | ruler (coarse) | ACCEPT | ACCEPT, 17.07mm | not precisely scoreable — ruler too coarse for sub-mm ground truth |
-| Real ring B (keyring-style ring) | 27.00mm | ruler | ACCEPT | ACCEPT, 26.63mm | 0.37mm |
+| Real ring B (keyring-style ring) | 27.00mm | ruler | ACCEPT | ACCEPT, 26.47mm | 0.53mm |
 | Real ring B, downscaled ~2.06x (same ring/photo, resolution reduced to match a real problem upload) | 27.00mm (same ring as above) | ruler (same measurement, reused) | **REJECT** | REJECT — `RESOLUTION_TOO_LOW` | n/a — correctly refuses at a resolution below what detection is validated for, instead of guessing |
 | Synthetic clean baseline | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.36mm | 0.04mm |
 | Synthetic specular highlight | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.40mm | 0.00mm |
@@ -147,26 +147,63 @@ Full pass/fail table, from the delivered code, `python3 backend/regression_suite
 Every rejected case rejects for the reason the test was designed to
 trigger, not an unrelated failure.
 
-**Detection architecture (current):** for each of the 6 segmentation
-variants (4 Canny threshold pairs, adaptive threshold, Otsu), the primary
-closed-contour detector runs first; if it can't get a clean inner+outer
-contour pair, a radial-histogram fallback (gradient-direction-filtered
-edge pixels binned by radius around an independently Hough-validated
-outer circle) now returns *every* genuine local peak in its histogram,
-not just the single tallest one, each tagged with its own rank. All
-candidates from all variants — contour-based and radial — are pooled,
-collapsed to one family each (canny/adaptive/otsu, since the 4 Canny
-variants are correlated), then grouped by proximity (1mm chaining) across
-families. A group only counts as genuine cross-method agreement, and can
-only be accepted, if it has candidates from at least 2 distinct families
-*and* every family in the group is represented by its own top-ranked
-peak — not a weak secondary peak that happens to land nearby. Groups that
-clear that bar must also agree spatially (family centroids within 2mm of
-each other in real space), which catches two methods finding two
-different round things rather than the same hole. This replaced an
-earlier design that collapsed each family down to one value *before*
-checking agreement, which could throw away a method's genuinely-correct
-candidate if its own single best guess happened to be wrong.
+**Detection architecture (current):** redesigned around finding the
+inner hole directly, not around scoring which circle looks "strongest."
+The previous design (described above until this revision) scored
+candidates by closure/cleanliness and cross-method agreement — but a
+ring's *outer* edge, a polished bevel, a specular reflection, or a cast
+shadow can all produce a clean, circular, multi-method-agreed-upon
+boundary just as easily as the true inner hole can. Two methods agreeing
+on a wrong edge is still a failure; low cross-method spread on a wrong
+edge looked, to the old scoring, exactly like confidence.
+
+ArUco calibration, perspective rectification, and the Hough-based outer-
+ring localization are unchanged and still run first — but strictly for
+coarse ROI localization ("roughly where is the ring"), never for
+deciding which boundary inside that ROI is the right one. Inside the
+ROI, every candidate boundary — from the existing contour-based
+Canny/adaptive/Otsu variants, the radial-histogram fallback, *and* a new
+independent `holecolor` family described below — must now pass a
+**material-contrast gate** before it is even allowed to compete for
+cross-method agreement: `validate_material_contrast` samples the color
+(Lab space) just inside the candidate boundary and in a narrow band just
+outside it, and compares both against this specific photo's own sampled
+background color (`sample_background_reference`, median + MAD over the
+rectified frame with the marker and ring ROI excluded — self-calibrating
+per photo, never a fixed absolute color, so it doesn't depend on table
+color or lighting). A candidate is rejected unless its interior matches
+the background and its exterior is meaningfully different from it. This
+targets each reported failure mode structurally, not by threshold
+tuning: the *outer* ring edge is rejected because just past it is
+background again — no contrast; a bevel or reflection is rejected
+because its interior is still ring material, not background; a cast
+shadow is rejected because both sides of it are still background (same
+color, different brightness only).
+
+`enclosed_hole_candidates` (family name `holecolor`) is a new,
+independent detection method that finds the hole directly instead of
+inferring it from edges: it segments background-colored pixels in the
+ROI via Lab-distance thresholding, then uses connected-component
+topology (`cv2.connectedComponents`) to find islands of that color fully
+enclosed by non-background material — which is what a hole structurally
+*is*, and what an outer edge, bevel, or shadow artifact structurally is
+not. This genuinely diversifies the method ensemble (a topological method
+alongside the existing edge/contour methods) rather than adding another
+variant of the same edge-detection idea.
+
+Only *after* a candidate clears the material-contrast gate does
+cross-family agreement apply (still requires candidates from >=2
+distinct families, spatial agreement within a real-space tolerance).
+Because every candidate reaching that stage has already been confirmed
+to look like an actual hole, low spread among already-rejected
+candidates can no longer produce a false accept — agreement is only
+ever measured among candidates that passed the physical check first.
+
+A debug overlay mode (`RING_DEBUG_OVERLAY=1` env var) renders the ROI,
+every validated candidate boundary (color-coded by family), every
+rejected candidate with its specific rejection reason, and the final
+selected boundary, for visual auditing of exactly what the pipeline
+considered and why it picked (or didn't pick) a given edge.
 
 ### Observed failures and limitations
 

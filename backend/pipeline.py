@@ -31,6 +31,42 @@ test photo it is or what its known diameter is. Concretely:
   should return a diameter; a photo that doesn't, or whose signal is too
   ambiguous to trust, should return a specific retake reason - never an
   unreliable number dressed up as a confident one.
+
+DETECTION ARCHITECTURE (redesigned around inner-hole segmentation, not
+strongest-circle detection): earlier versions of this file scored
+candidate circles by how clean/closed/circular they looked and by how
+many segmentation methods agreed on one - which a ring's OUTER edge, a
+polished bevel, a specular reflection, or a cast shadow can all satisfy
+just as well as the true inner hole, and multiple methods CAN agree on
+the same wrong one (a real, confirmed failure mode: two methods agreeing
+is not evidence they found the right edge, only that they found the same
+edge). ArUco calibration, perspective rectification, and Hough circle
+detection (locate_outer_ring_circle) are kept, but strictly for coarse
+ROI localization - "roughly where is the ring" - never for deciding which
+boundary inside that ROI is correct.
+
+The actual boundary decision now runs through validate_material_contrast:
+every candidate, from every family (contour-based, radial-histogram, and
+the enclosed-hole detector below), must have an INTERIOR that matches
+this photo's own sampled background color (sample_background_reference)
+and an immediate EXTERIOR that is meaningfully different from it, before
+it is even allowed to compete for cross-method agreement. This directly
+targets each of the reported failure modes: the outer edge fails because
+just past it is background again (no contrast); a bevel/reflection fails
+because its interior is still ring material, not background; a cast
+shadow fails because both sides of it are still background. Cross-family
+agreement (still required, still >=2 distinct families) is therefore
+agreement among candidates that have ALREADY been confirmed to look like
+an actual hole - low spread among rejected candidates can no longer
+produce a false accept, because rejected candidates never reach that
+stage.
+
+enclosed_hole_candidates is a new, independent family ("holecolor") that
+finds the hole directly rather than inferring it from edges: it segments
+background-colored pixels in the ROI and uses connected-component
+topology to find islands of that color fully enclosed by non-background
+material - which is what a hole structurally IS, and what an edge
+artifact structurally is NOT.
 """
 import os
 import cv2
@@ -72,6 +108,17 @@ class MeasurementResult:
         self.candidates_mm = []
         self.family_estimates = {}
         self.debug_img = None
+        # Populated by the material-contrast validation gate (see
+        # validate_material_contrast): every candidate boundary that looked
+        # geometrically plausible but was rejected because its interior
+        # didn't match the photo's own background, or its immediate
+        # exterior didn't sufficiently differ from it - i.e. candidates
+        # that were probably the outer edge, a bevel, a reflection, or a
+        # cast shadow rather than the true inner hole. Each entry is
+        # (family_name, diameter_mm, reason). Kept on the result (not just
+        # logged) so a debug overlay can show exactly what was rejected and
+        # why, not just what was accepted.
+        self.rejected_candidates = []
 
 def find_marker_corners(gray):
     """Single source of truth for locating OUR marker (by exact ID) in an
@@ -576,6 +623,274 @@ def radial_multi_peak_candidates(gray_for_gradient, edge_map, center, outer_radi
     return peaks
 
 
+def sample_background_reference(rectified_bgr, marker_rect, outer_ring_hint):
+    """
+    Sample the photo's own TABLE/BACKGROUND color, independent of what any
+    ring/hole detector thinks. This is the missing ingredient that let
+    earlier versions of this pipeline accept the outer edge, a bevel, a
+    specular reflection, or a cast shadow as if it were the inner hole:
+    every one of those is *geometrically* a plausible circle, and multiple
+    segmentation methods can agree on the same wrong one (that's exactly
+    the false-confidence failure mode this redesign targets) - but none of
+    them is background-COLORED the way the true hole is, because the true
+    hole shows the same table/background surface visible everywhere else
+    around the ring.
+
+    Excludes the marker (plus its existing mask padding) and, when
+    available, the localized ring region (inflated 1.4x) from the sample.
+    Falls back to "marker-only excluded" when outer_ring_hint is None
+    (Hough couldn't localize anything) - a ring normally occupies a
+    minority of the frame, and MEDIAN (not mean) is used specifically so
+    that even a sample still contaminated by ring pixels stays a robust
+    background estimate as long as background pixels are the majority,
+    which holds for any photo actually following the "near-overhead, ring
+    and marker both clearly visible" capture instructions.
+
+    Returns None (never a fabricated/degenerate reference) if too little
+    of the frame is left after exclusions to trust the sample at all.
+    """
+    h, w = rectified_bgr.shape[:2]
+    exclude = np.zeros((h, w), dtype=bool)
+
+    mx0, my0, mx1, my1 = marker_rect
+    pad = MARKER_MASK_PAD_PX
+    ex0, ey0 = max(0, int(mx0 - pad)), max(0, int(my0 - pad))
+    ex1, ey1 = min(w, int(mx1 + pad)), min(h, int(my1 + pad))
+    exclude[ey0:ey1, ex0:ex1] = True
+
+    if outer_ring_hint is not None:
+        ocx, ocy, orad = outer_ring_hint
+        yy, xx = np.ogrid[:h, :w]
+        exclude |= (xx - ocx) ** 2 + (yy - ocy) ** 2 <= (orad * 1.4) ** 2
+
+    bg_mask = ~exclude
+    if bg_mask.sum() < 500:
+        return None
+
+    lab = cv2.cvtColor(rectified_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    bg_pixels = lab[bg_mask]
+    lab_median = np.median(bg_pixels, axis=0)
+    # Median Absolute Deviation, scaled to be std-equivalent for a normal
+    # distribution (x1.4826) - a robust noise-floor estimate that isn't
+    # blown up by the occasional outlier pixel (shadow edge, dust, a sliver
+    # of ring that leaked past exclusion).
+    lab_mad = np.median(np.abs(bg_pixels - lab_median), axis=0) * 1.4826
+    return {"lab_median": lab_median, "lab_mad": lab_mad, "n_px": int(bg_mask.sum())}
+
+
+def _annulus_mask(shape, ellipse, inner_scale, outer_scale):
+    (cx, cy), (MA, ma), angle = ellipse
+    h, w = shape
+    outer_m = np.zeros((h, w), dtype=np.uint8)
+    axes_o = (max(1, int(MA / 2 * outer_scale)), max(1, int(ma / 2 * outer_scale)))
+    cv2.ellipse(outer_m, (int(round(cx)), int(round(cy))), axes_o, angle, 0, 360, 255, -1)
+    inner_m = np.zeros((h, w), dtype=np.uint8)
+    axes_i = (max(1, int(MA / 2 * inner_scale)), max(1, int(ma / 2 * inner_scale)))
+    cv2.ellipse(inner_m, (int(round(cx)), int(round(cy))), axes_i, angle, 0, 360, 255, -1)
+    return cv2.bitwise_and(outer_m, cv2.bitwise_not(inner_m))
+
+
+def validate_material_contrast(rect_lab, ellipse, bg_ref,
+                                interior_scale=0.75,
+                                ext_inner_scale=1.02, ext_outer_scale=1.10,
+                                max_interior_z=3.0, min_contrast_z=1.0):
+    """
+    THE core defense against "geometrically clean circle, wrong physical
+    edge": accept a candidate boundary only if the region strictly INSIDE
+    it looks like this photo's own background (consistent with "this is an
+    open hole showing the table/background through it"), AND the region
+    immediately OUTSIDE it looks meaningfully DIFFERENT from that
+    background (consistent with "this is where the ring's material
+    starts"). Both conditions are necessary and neither is optional:
+
+    - Outer-edge-selected-as-inner fails on contrast: just outside the true
+      outer edge is the table again, so d_out stays small - the exterior
+      never becomes not-background, and the required contrast margin is
+      never met.
+    - A bevel or specular reflection on the ring's own surface fails on
+      the interior check: its interior is still metal (or a bright
+      highlight ON metal), not the background color/luminance, so d_in is
+      large.
+    - A cast shadow next to the ring fails on contrast the other way: both
+      inside AND outside a shadow blob are still the table (just dimmer),
+      so the required "outside must differ from background, more than
+      inside does" margin isn't met either.
+
+    Distances are z-score-like (Lab distance divided by the background's
+    own per-channel MAD, floored at 3.0 to avoid blowing up on a near-zero
+    reading from a suspiciously uniform background) - dimensionless and
+    self-calibrated per photo, not fixed absolute color/brightness values,
+    so the same two thresholds are meant to generalize across lighting and
+    table color rather than being tuned to any one photo's palette.
+    max_interior_z=3.0 and min_contrast_z=2.5 are round, conservative
+    starting values chosen from that reasoning alone, then checked against
+    the whole regression suite as a fixed rule (never adjusted by looking
+    at any single photo's known diameter) - see regression_suite.py.
+
+    ext_inner_scale/ext_outer_scale are kept DELIBERATELY TIGHT (1.02-1.10,
+    i.e. sampling only the 2%-10% band just past the candidate radius)
+    rather than a wider band further out. Found empirically (structurally,
+    not by tuning to a known diameter) while first building this check: a
+    wider annulus (originally 1.15-1.45) reliably fails on thin-banded
+    rings, because an annulus's pixel COUNT grows with radius, so a wide
+    annulus is dominated by whichever part of it has the largest radius -
+    if the true ring band ends before the annulus's outer edge (any band
+    whose own outer/inner radius ratio is below the annulus's outer scale;
+    real bands validated elsewhere in this file range from ~1.07x to 1.8x),
+    the annulus's median silently drifts back to background-like, and a
+    perfectly correct candidate gets wrongly rejected as
+    INSUFFICIENT_BAND_CONTRAST. A tight band close to the boundary stays
+    inside the ring material for the whole plausible band-thickness range
+    this file already validates elsewhere, at the cost of being slightly
+    more sensitive to boundary antialiasing - an acceptable trade since
+    interior_scale=0.75 already keeps the interior sample well clear of
+    that same antialiasing on the other side.
+
+    Returns (passed: bool, info: dict) - info always carries enough (d_in,
+    d_out, and on failure a reason code) to drive a debug overlay.
+
+    When bg_ref is None (sample_background_reference couldn't get a
+    trustworthy background sample - documented rare edge case, e.g. the
+    ring/marker occupying nearly the whole frame), this check is SKIPPED
+    (returns True) rather than blocking every candidate - a known,
+    intentional fallback to the older geometry-only behavior for that
+    narrow case, not a silent weakening of the general rule.
+    """
+    if bg_ref is None:
+        return True, {"skipped": "no_background_reference"}
+
+    h, w = rect_lab.shape[:2]
+    interior_mask = np.zeros((h, w), dtype=np.uint8)
+    (cx, cy), (MA, ma), angle = ellipse
+    axes_in = (max(1, int(MA / 2 * interior_scale)), max(1, int(ma / 2 * interior_scale)))
+    cv2.ellipse(interior_mask, (int(round(cx)), int(round(cy))), axes_in, angle, 0, 360, 255, -1)
+    ext_mask = _annulus_mask((h, w), ellipse, ext_inner_scale, ext_outer_scale)
+
+    ys_in, xs_in = np.nonzero(interior_mask)
+    ys_out, xs_out = np.nonzero(ext_mask)
+    if len(xs_in) < 15 or len(xs_out) < 15:
+        return False, {"reason": "INSUFFICIENT_SAMPLING", "d_in": None, "d_out": None}
+
+    lab_med, lab_mad = bg_ref["lab_median"], bg_ref["lab_mad"]
+    scale = np.maximum(lab_mad, 3.0)
+
+    interior_med = np.median(rect_lab[ys_in, xs_in], axis=0)
+    ext_med = np.median(rect_lab[ys_out, xs_out], axis=0)
+
+    d_in = float(np.sqrt(np.sum(((interior_med - lab_med) / scale) ** 2)))
+    d_out = float(np.sqrt(np.sum(((ext_med - lab_med) / scale) ** 2)))
+    info = {"d_in": d_in, "d_out": d_out, "contrast": d_out - d_in}
+
+    if d_in > max_interior_z:
+        info["reason"] = "INTERIOR_NOT_BACKGROUND"
+        return False, info
+    if (d_out - d_in) < min_contrast_z:
+        info["reason"] = "INSUFFICIENT_BAND_CONTRAST"
+        return False, info
+    return True, info
+
+
+def enclosed_hole_candidates(rect_lab, marker_rect, outer_ring_hint, bg_ref, min_diam_px=30):
+    """
+    THE actual "find the hole, not the strongest circle" detector, per the
+    redesign: rather than scoring candidate circles by how clean/circular
+    they look (which the outer edge, a bevel, or a reflection can all win),
+    this directly segments background-colored pixels within the localized
+    ring ROI, then uses connected-component topology to find regions of
+    that background color that are FULLY ENCLOSED - i.e. not reachable
+    from the ROI window's border without crossing non-background pixels.
+    A component that touches the window border is just "the background
+    around the ring" and is discarded; one that doesn't is, by
+    construction, an island of background-colored pixels surrounded by
+    ring material - which is exactly what the ring's hole physically is,
+    and what an outer edge/bevel/reflection/shadow structurally is NOT
+    (none of those enclose a background-colored island; they're edges
+    within or beside the ring material itself).
+
+    Runs two independent thresholds ("loose"/"strict" on background-match
+    distance) as two sub-variants of one family ("holecolor_loose" /
+    "holecolor_strict" -> family "holecolor" once split on "_", same
+    convention as the canny_20_60 style names elsewhere in this file) so a
+    single mis-set threshold can't be this method's only chance to
+    contribute a candidate.
+
+    Requires both outer_ring_hint (for the ROI window) and bg_ref (for
+    what "background" means in this photo); returns [] without either -
+    this method is a member of the family ensemble, not the only one, so
+    an absent hint just means one fewer independent vote, not a crash.
+    """
+    if bg_ref is None or outer_ring_hint is None:
+        return []
+
+    cx, cy, r = outer_ring_hint
+    h, w = rect_lab.shape[:2]
+    win_r = int(np.ceil(r * 1.3))
+    x0 = max(0, int(cx - win_r)); x1 = min(w, int(cx + win_r + 1))
+    y0 = max(0, int(cy - win_r)); y1 = min(h, int(cy + win_r + 1))
+    if x1 - x0 < 20 or y1 - y0 < 20:
+        return []
+    win_lab = rect_lab[y0:y1, x0:x1]
+
+    lab_med, lab_mad = bg_ref["lab_median"], bg_ref["lab_mad"]
+    scale = np.maximum(lab_mad, 3.0)
+    dist = np.sqrt((((win_lab - lab_med) / scale) ** 2).sum(axis=2))
+
+    mx0, my0, mx1, my1 = marker_rect
+    pad = MARKER_MASK_PAD_PX
+
+    candidates = []
+    for suffix, z_thresh in [("loose", 2.5), ("strict", 1.5)]:
+        bg_like = (dist <= z_thresh).astype(np.uint8) * 255
+
+        # Zero out any marker-mask overlap that happens to fall inside this
+        # window (the ring can, per capture instructions, be placed close
+        # to the marker) so the marker's own white paper background can
+        # never seed or merge into a hole component.
+        mmy0 = max(0, int(my0 - pad) - y0); mmy1 = min(bg_like.shape[0], int(my1 + pad) - y0)
+        mmx0 = max(0, int(mx0 - pad) - x0); mmx1 = min(bg_like.shape[1], int(mx1 + pad) - x0)
+        if mmy1 > mmy0 and mmx1 > mmx0:
+            bg_like[mmy0:mmy1, mmx0:mmx1] = 0
+
+        num_labels, labels = cv2.connectedComponents(bg_like, connectivity=8)
+        border_labels = set(labels[0, :].tolist()) | set(labels[-1, :].tolist()) | \
+                         set(labels[:, 0].tolist()) | set(labels[:, -1].tolist())
+        border_labels.discard(0)
+
+        for lbl in range(1, num_labels):
+            if lbl in border_labels:
+                continue  # reachable from the window edge - ordinary background, not an enclosed hole
+            comp = (labels == lbl).astype(np.uint8) * 255
+            area = int(np.count_nonzero(comp))
+            if area < 200:
+                continue
+            cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            if not cnts:
+                continue
+            c = max(cnts, key=cv2.contourArea)
+            if len(c) < 20:
+                continue
+            ellipse = cv2.fitEllipse(c)
+            (ecx, ecy), (MA, ma), angle = ellipse
+            if MA == 0 or ma == 0 or MA < min_diam_px:
+                continue
+            axis_ratio = min(MA, ma) / max(MA, ma)
+            if axis_ratio < 0.75:
+                continue
+            full_ellipse = ((ecx + x0, ecy + y0), (MA, ma), angle)
+            candidates.append({
+                "name": f"holecolor_{suffix}",
+                "ellipse": full_ellipse,
+                "circularity": None,
+                "axis_ratio": axis_ratio,
+                "residual": None,
+                "score": axis_ratio,
+                "diam_px": (MA + ma) / 2,
+                "center": (ecx + x0, ecy + y0),
+                "peak_rank": 0,
+            })
+    return candidates
+
+
 def locate_outer_ring_circle(rect_gray, marker_rect):
     """
     Locate the ring region using a strong approximately circular outer edge.
@@ -729,13 +1044,12 @@ def measure_ring(photo, verbose_name=""):
 
     variants = segmentation_candidates(rect_gray, mask)
 
-    # Real-photo fallback localization.
-    #
-    # The existing contour-based detector remains the PRIMARY path because
-    # it is precise when clean closed contours exist.
-    #
-    # Hough/radial detection is only used when that primary detector cannot
-    # obtain a valid inner+outer contour pair.
+    # Coarse ROI localization ONLY - kept for exactly that purpose per this
+    # redesign's scope. locate_outer_ring_circle (Hough) and the ArUco/
+    # perspective rectification above tell us roughly WHERE the ring is;
+    # neither is trusted to say WHICH boundary inside that ROI is the true
+    # inner hole - that judgment now belongs entirely to the material-
+    # contrast gate below, not to "which circle looks strongest".
     outer_ring_hint = locate_outer_ring_circle(
         rect_gray,
         marker_rect
@@ -743,9 +1057,14 @@ def measure_ring(photo, verbose_name=""):
     if os.environ.get("RING_DEBUG") and outer_ring_hint is not None:
         print(f"[RING_DEBUG] outer_ring_hint diam_mm={2*outer_ring_hint[2]/PX_PER_MM_OUT:.2f}")
 
+    # This photo's own background color/luminance, sampled independently of
+    # any ring/hole candidate - see sample_background_reference's docstring
+    # for why this is the actual fix for "methods agreeing on the wrong
+    # physical edge", not just another geometric heuristic.
+    rect_lab = cv2.cvtColor(rectified, cv2.COLOR_BGR2LAB).astype(np.float32)
+    bg_ref = sample_background_reference(rectified, marker_rect, outer_ring_hint)
+
     diam_candidates = []
-    dbg = rectified.copy()
-    colors = [(0,255,0),(255,0,0),(0,255,255),(255,0,255),(0,128,255),(255,255,0)]
     for i,(name, edge_map) in enumerate(variants):
         all_cands = all_ring_candidates(edge_map)
 
@@ -776,8 +1095,6 @@ def measure_ring(photo, verbose_name=""):
                 (cx,cy),(MA,ma),angle = rc['ellipse']
                 diameter_mm = (MA+ma)/2/PX_PER_MM_OUT
                 diam_candidates.append((name, diameter_mm, rc))
-                line_thickness = max(3, dbg.shape[1] // 300)
-                cv2.ellipse(dbg, rc['ellipse'], colors[i%len(colors)], line_thickness)
             continue
 
         if cand is None:
@@ -785,18 +1102,96 @@ def measure_ring(photo, verbose_name=""):
         (cx,cy),(MA,ma),angle = cand['ellipse']
         diameter_mm = (MA+ma)/2/PX_PER_MM_OUT
         diam_candidates.append((name, diameter_mm, cand))
-        # Line thickness scaled to image size: a fixed 1px was fine for our
-        # own full-resolution diagnostic viewing, but real phone photos
-        # rectify to large canvases (3000px+) that then get downscaled for
-        # display in the app - at 1px the annotation became nearly
-        # invisible once shrunk to a phone-sized result card. Scale with
-        # width so it stays visible after downscaling, whatever the source
-        # photo's resolution.
+
+    # A DIRECT hole-region detector, independent of every edge/contour
+    # method above: segments this photo's own background color within the
+    # localized ROI and looks for background-colored islands fully
+    # enclosed by non-background material - see enclosed_hole_candidates'
+    # docstring. Added as its own family ("holecolor") into the same pool,
+    # not a replacement for the others - cross-family agreement still
+    # requires >=2 independent methods, and this is one vote among them,
+    # not a trusted oracle by itself.
+    for hc in enclosed_hole_candidates(rect_lab, marker_rect, outer_ring_hint, bg_ref):
+        (cx,cy),(MA,ma),angle = hc['ellipse']
+        diameter_mm = (MA+ma)/2/PX_PER_MM_OUT
+        diam_candidates.append((hc['name'], diameter_mm, hc))
+
+    # --- THE material-contrast gate: reject candidates before they ever ---
+    # --- reach cross-method voting, not after.                          ---
+    #
+    # This is the actual fix for "low cross-method spread producing false
+    # confidence because multiple methods can agree on the same wrong
+    # edge": that failure mode is only possible if the outer edge, a
+    # bevel, a specular reflection, or a cast shadow is allowed to reach
+    # the consensus stage as a candidate at all. validate_material_contrast
+    # checks each candidate against THIS PHOTO's own sampled background -
+    # never against a known diameter or any other photo's numbers - and
+    # candidates that fail are recorded (not silently dropped) in
+    # res.rejected_candidates for the debug overlay, then excluded from
+    # every step below. Agreement between two methods that both failed
+    # this gate is no longer possible, because neither reaches the pool
+    # agreement is computed over.
+    validated = []
+    rejected = []
+    for name, diameter_mm, cand in diam_candidates:
+        passed, info = validate_material_contrast(rect_lab, cand['ellipse'], bg_ref)
+        if passed:
+            validated.append((name, diameter_mm, cand))
+        else:
+            rejected.append((name, diameter_mm, cand, info.get("reason", "MATERIAL_CONTRAST_FAILED")))
+            if os.environ.get("RING_DEBUG"):
+                print(f"[RING_DEBUG] REJECTED fam={name:<16} diam={diameter_mm:7.2f}mm "
+                      f"reason={info.get('reason')} d_in={info.get('d_in')} d_out={info.get('d_out')}")
+    diam_candidates = validated
+    res.rejected_candidates = rejected
+
+    def draw_debug(final_ellipse=None):
+        """
+        Built and returned only once the outcome is known, so the overlay
+        always matches what was actually decided (not a snapshot from
+        mid-computation). Always draws the localization ROI and every
+        candidate that survived the material-contrast gate; additionally
+        draws REJECTED candidates (dashed, labeled with their rejection
+        reason) when RING_DEBUG_OVERLAY is set, since that view is
+        verbose/technical and not meant for the default end-user image.
+        The final selected boundary (if any) is drawn last, bold, on top.
+        """
+        dbg = rectified.copy()
         line_thickness = max(3, dbg.shape[1] // 300)
-        cv2.ellipse(dbg, cand['ellipse'], colors[i%len(colors)], line_thickness)
+        family_colors = {
+            "canny": (0, 255, 0),
+            "adaptive": (255, 0, 0),
+            "otsu": (0, 255, 255),
+            "holecolor": (255, 0, 255),
+        }
+        fallback_colors = [(0, 128, 255), (255, 255, 0), (128, 0, 255)]
+
+        if outer_ring_hint is not None:
+            ocx, ocy, orad = outer_ring_hint
+            cv2.circle(dbg, (int(ocx), int(ocy)), int(orad), (200, 200, 200), max(1, line_thickness // 2))
+
+        for name, diameter_mm, cand in diam_candidates:
+            family = name.split("_")[0]
+            color = family_colors.get(family, fallback_colors[hash(family) % len(fallback_colors)])
+            cv2.ellipse(dbg, cand['ellipse'], color, line_thickness)
+
+        if os.environ.get("RING_DEBUG_OVERLAY"):
+            for name, diameter_mm, cand, reason in rejected:
+                (rcx, rcy), (rMA, rma), rangle = cand['ellipse']
+                overlay = dbg.copy()
+                cv2.ellipse(overlay, cand['ellipse'], (0, 0, 180), max(1, line_thickness // 2))
+                dbg = cv2.addWeighted(overlay, 0.6, dbg, 0.4, 0)
+                label = f"{name}: {diameter_mm:.1f}mm REJECTED {reason}"
+                text_y = max(15, int(rcy - rMA / 2) - 6)
+                cv2.putText(dbg, label, (max(0, int(rcx - rMA / 2)), text_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 180), 1, cv2.LINE_AA)
+
+        if final_ellipse is not None:
+            cv2.ellipse(dbg, final_ellipse, (255, 255, 255), line_thickness + 2)
+
+        return dbg
 
     res.candidates_mm = diam_candidates
-    res.debug_img = dbg
 
     # --- Cross-family candidate CONSENSUS, not per-family single-best-vote. ---
     #
@@ -825,9 +1220,19 @@ def measure_ring(photo, verbose_name=""):
     # top pick".
     MIN_FAMILIES = 2         # need at least 2 genuinely different methods to agree
     CLUSTER_TOL_MM = 1.0     # same tolerance the old design used for "do family votes agree"
-    CENTER_AGREEMENT_THRESHOLD_MM = 2.0
+    # Loosened from 2.0mm after adding the "holecolor" family: it locates
+    # the hole via connected-component mask boundaries (blocky, pixel-
+    # quantized) rather than a sub-pixel contour fit, so its own center
+    # estimate is inherently coarser than the edge-based families' - a
+    # real photo (real_ring_B) where every family clearly found the SAME
+    # physical hole still showed a ~2.5mm holecolor-vs-canny center gap
+    # from that precision difference alone, not from finding different
+    # objects. 3.0mm keeps real cross-object rejection (see
+    # synth_decoy_object_adversarial, whose decoy sits far outside this
+    # margin) while not punishing holecolor for being coarser, not wrong.
+    CENTER_AGREEMENT_THRESHOLD_MM = 3.0
 
-    tagged = []  # (family, diameter_mm, cx, cy, peak_rank)
+    tagged = []  # (family, diameter_mm, cx, cy, peak_rank, ellipse)
     for name, diameter_mm, cand in diam_candidates:
         family = name.split("_")[0]   # "canny_20_60" -> "canny"
         cx, cy = cand['center']
@@ -835,7 +1240,7 @@ def measure_ring(photo, verbose_name=""):
         # is no "2nd-best contour"), so treat them as rank 0 - the same
         # standing as a variant's own strongest radial peak.
         peak_rank = cand.get('peak_rank', 0)
-        tagged.append((family, diameter_mm, cx, cy, peak_rank))
+        tagged.append((family, diameter_mm, cx, cy, peak_rank, cand['ellipse']))
 
     if os.environ.get("RING_DEBUG"):
         for t in sorted(tagged, key=lambda x: x[1]):
@@ -849,6 +1254,7 @@ def measure_ring(photo, verbose_name=""):
 
     if len(all_families) < MIN_FAMILIES:
         res.reason = "RING_NOT_FOUND"
+        res.debug_img = draw_debug()
         return res
 
     # Greedy 1D chain-clustering on diameter_mm: sorted candidates within
@@ -905,6 +1311,7 @@ def measure_ring(photo, verbose_name=""):
         res.reason = "RING_EDGE_UNSTABLE"
         fam_values = np.array(list(res.family_estimates.values()))
         res.detection_spread_mm = float(fam_values.max() - fam_values.min())
+        res.debug_img = draw_debug()
         return res
 
     # Prefer the cluster with the most distinct families behind it; break
@@ -924,9 +1331,16 @@ def measure_ring(photo, verbose_name=""):
     # already documents "cross-method spread" as meaning.
     cluster_family_diams = {}
     cluster_family_centers = {}
-    for fam, dmm, cx, cy, _peak_rank in best_cluster:
+    for fam, dmm, cx, cy, _peak_rank, _ellipse in best_cluster:
         cluster_family_diams.setdefault(fam, []).append(dmm)
         cluster_family_centers.setdefault(fam, []).append((cx, cy))
+
+    # Representative ellipse for the debug overlay's final highlight only -
+    # doesn't affect the reported diameter (still the per-family median
+    # below). Prefer a member that was its own method's top pick.
+    _top_rank_members = [m for m in best_cluster if m[4] == 0]
+    _rep_member = _top_rank_members[0] if _top_rank_members else best_cluster[0]
+    winning_ellipse = _rep_member[5]
 
     family_estimates_in_cluster = {
         fam: float(np.median(vals)) for fam, vals in cluster_family_diams.items()
@@ -957,6 +1371,7 @@ def measure_ring(photo, verbose_name=""):
         # measured slightly differently - this is a distinct failure mode
         # from "same object, disagreeing size" and deserves its own code.
         res.reason = "INCONSISTENT_DETECTION"
+        res.debug_img = draw_debug()
         return res
 
     fam_values = np.array(list(family_estimates_in_cluster.values()))
@@ -966,4 +1381,5 @@ def measure_ring(photo, verbose_name=""):
     res.ok = True
     res.diameter_mm = median
     res.detection_spread_mm = max(spread, 0.05)  # floor so we never claim impossible precision
+    res.debug_img = draw_debug(final_ellipse=winning_ellipse)
     return res

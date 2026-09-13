@@ -13,11 +13,19 @@ diameter entry, no manual scale calibration.
 ## Architecture
 
 - **backend/** — FastAPI service wrapping a deterministic OpenCV pipeline
-  (ArUco marker detection → homography rectification → multi-method inner
-  boundary detection → US ring size lookup). No ML model, no LLM in the
-  measurement path — see `pipeline.py`'s module docstring and inline
+  (ArUco marker detection → homography rectification → coarse ring ROI
+  localization → inner-hole segmentation, validated against the photo's
+  own background color → US ring size lookup). No ML model, no LLM in
+  the measurement path — see `pipeline.py`'s module docstring and inline
   comments for why, and for the specific real-photo failures that shaped
-  each guardrail.
+  each guardrail. ArUco/homography/Hough are used only to locate roughly
+  where the ring is; which boundary inside that area is the true inner
+  hole (as opposed to the outer edge, a bevel, a reflection, or a cast
+  shadow) is decided by a material-contrast check against the photo's
+  own sampled background, not by which candidate looks "cleanest" or by
+  how many methods happen to agree on it. Set `RING_DEBUG_OVERLAY=1` to
+  get back an overlay image showing every candidate considered, every
+  rejected candidate with its rejection reason, and the one selected.
 - **frontend/** — vanilla HTML/CSS/JS single-page app (no build step).
   Talks to the backend over `fetch`.
 
@@ -95,7 +103,7 @@ measured against this pipeline:
 | Photo | Caliper/ruler ground truth | Pipeline result | Abs. error |
 |---|---|---|---|
 | IMG_9783 (steel ring, mild angle) | ~17mm (ruler, coarse) | 17.07mm | — (ruler too coarse to score precisely) |
-| IMG_9784 (keyring-style ring) | 27mm (ruler) | 26.63mm | 0.37mm |
+| IMG_9784 (keyring-style ring) | 27mm (ruler) | 26.47mm | 0.53mm |
 
 Six synthetic stress photos (clean, specular highlight, shadow gradient,
 low contrast, textured background, heavy blur) and one adversarial decoy
