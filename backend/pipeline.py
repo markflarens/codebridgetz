@@ -1,3 +1,37 @@
+"""
+Ring measurement pipeline (deterministic computer vision, no ML/LLM).
+
+GENERALIZATION / NO-OVERFITTING POLICY (read before touching this file):
+Every decision in this file - which segmentation variant to trust, which
+Hough circle is the outer boundary, whether cross-method agreement is
+tight enough to accept - must be made from GEOMETRY and CROSS-METHOD
+AGREEMENT on the photo actually being measured, never from which specific
+test photo it is or what its known diameter is. Concretely:
+
+- This file must never import, read, or branch on test_set/ ground truth
+  (regression_suite.py's CASES list, expected_vs_actual.csv, or any
+  literal ground-truth mm value copy-pasted from them). Ground truth is
+  read ONLY by regression_suite.py, and only AFTER measure_ring() has
+  already returned a result - to score error, never to steer detection.
+- Do not add logic that identifies a specific input photo (by filename,
+  by an image hash, by a "if this looks like the keyring photo" special
+  case) and special-cases it. A rule that only fires on one known photo
+  is not a fix, it's memorization, and it will not generalize to a new
+  ring nobody has seen yet.
+- When calibrating a threshold, validate it against the whole labeled set
+  as a fixed decision rule applied uniformly - not by trying several
+  candidate rules and picking whichever one happens to land closest to a
+  known answer on one specific photo. This project has done the latter
+  by mistake before (see git history around commits 3e07ad8 / 0767fc5:
+  a "fix" was reverted specifically because it had been tuned by checking
+  its output against one photo's known ground truth, and turned out to
+  give a confidently WRONG answer once inspected properly - a policy
+  violation that produced a real bug, not just a style problem).
+- A photo that satisfies the documented supported-capture conditions
+  should return a diameter; a photo that doesn't, or whose signal is too
+  ambiguous to trust, should return a specific retake reason - never an
+  unreliable number dressed up as a confident one.
+"""
 import cv2
 import numpy as np
 

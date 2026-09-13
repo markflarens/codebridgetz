@@ -107,6 +107,26 @@ the photos — exactly as noted per-row below. This avoids the obvious bias
 of tuning thresholds against a ground truth you already know the
 algorithm's own answer for.
 
+**Generalization policy — ground truth is used only to score, never to
+detect.** `pipeline.py` must generalize to new, unseen ring photos; it
+must not special-case a known test photo or its known answer. Concretely:
+candidate selection is decided purely by geometry (contour circularity,
+concentricity of an inner/outer pair) and cross-method agreement (do
+independent segmentation methods — Canny at several thresholds, adaptive
+threshold, Otsu — land on the same boundary), never by comparing a
+candidate's diameter against a ground-truth value and picking whichever
+one matches best. `regression_suite.py` reads ground truth only *after*
+`measure_ring()` has already returned, purely to compute error for the
+table below. This is now enforced mechanically, not just documented:
+`regression_suite.py` statically scans `pipeline.py`'s actual code (with
+comments/docstrings stripped, so honest documentation referencing real
+numbers isn't mistaken for a leak) for any of this file's ground-truth
+values or test-photo filenames, and fails the whole run if it finds one.
+This project violated this policy once during development — see
+"Observed failures and limitations" below for the concrete example of
+what went wrong and how it was caught — which is why the check exists as
+code now, not just as a promise in this paragraph.
+
 Full pass/fail table, from the delivered code, `python3 backend/regression_suite.py`:
 
 | Test case | Ground truth | Ground truth method | Expected result | Actual result | Abs. error |
@@ -128,6 +148,19 @@ trigger, not an unrelated failure.
 
 ### Observed failures and limitations
 
+- **Real-ring diversity is thin (2 real rings).** Both currently-passing
+  real photos are useful but narrow evidence: one thin steel band, one
+  thick reflective keyring-style ring. That demonstrates the algorithm
+  works on these two specific rings, not that it generalizes across ring
+  types. Several more real photos are needed — different diameters, band
+  widths, finishes (matte/polished/brushed), reflectivity, and
+  backgrounds — each with ground truth measured independently
+  (calipers/ruler) before running the app, added as new rows in
+  `regression_suite.py`'s `CASES` list. This is flagged as a known gap
+  rather than filled with synthetic substitutes: synthetic renders are
+  useful for stress-testing specific failure modes (exactly what the
+  eight synthetic cases above do) but do not substitute for real, unseen
+  rings when the claim being tested is generalization.
 - **Resolution sensitivity (real, reproduced, not yet fixed):** the
   detection thresholds are calibrated against full-resolution phone
   photos (~3000×4000px). Taking the already-passing Real ring B photo and

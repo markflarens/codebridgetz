@@ -23,9 +23,12 @@ work and now doesn't is a hard failure.
 Usage: python3 regression_suite.py   (run from inside backend/)
 Exit code 0 = all pass, 1 = at least one failure.
 """
+import ast
+import io
 import os
 import sys
 import time
+import tokenize
 import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -36,6 +39,18 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 TEST_SET_DIR = os.path.normpath(os.path.join(_HERE, "..", "test_set"))
 
 # (label, filename in test_set/, expected_status, ground_truth_mm_or_None, max_allowed_error_mm_or_None)
+#
+# REAL-RING DIVERSITY: only two real rings are in this set today (A: thin
+# steel band, mild angle; B: thick reflective keyring-style ring). That is
+# not enough to claim the algorithm generalizes across ring types - it
+# only demonstrates it works on these two specific rings. To actually test
+# generalization, add several more REAL photos (not synthetic renders) of
+# visually different rings: different diameters, band widths, finishes
+# (matte vs. polished vs. brushed), reflectivity, and backgrounds. For
+# each new photo: measure the ring's true diameter with calipers/a ruler
+# BEFORE running it through the app (ground truth must be recorded
+# independently of this pipeline's own output - see the policy note
+# below), then add one row here with that filename and ground truth.
 CASES = [
     ("real_ring_A_9783",        "real_ring_A_IMG_9783.jpg",             "ACCEPT", None,  None),
     ("real_ring_B_9784",        "real_ring_B_IMG_9784.jpg",             "ACCEPT", 27.0,  1.0),
@@ -50,9 +65,78 @@ CASES = [
 ]
 
 
+def check_no_ground_truth_leakage():
+    """
+    Enforce, mechanically rather than by promise, that pipeline.py never
+    reads or branches on this file's ground-truth values or filenames.
+    Candidate selection / threshold decisions must come from geometry and
+    cross-method agreement on whatever photo is actually being measured -
+    never from already knowing the right answer for a specific test photo.
+    This project shipped exactly that mistake once (a "fix" tuned by
+    checking its output against one photo's known diameter, reverted after
+    it turned out to silently give a wrong answer - see git history around
+    commits 3e07ad8 / 0767fc5) - this check exists so a future change
+    can't reintroduce it unnoticed.
+    """
+    pipeline_src_path = os.path.join(os.path.dirname(os.path.abspath(pipeline.__file__)), "pipeline.py")
+    with open(pipeline_src_path, "r") as f:
+        src = f.read()
+
+    # Scan CODE only, not prose: this file's own docstrings legitimately
+    # narrate past findings using real numbers/filenames (e.g. "the true
+    # peak landed within 0.2mm of the ~27mm ground truth" as an
+    # explanation of why a threshold is calibrated the way it is) - that's
+    # documentation, not a control-flow dependency on ground truth, and
+    # flagging it would just teach people to stop writing honest comments.
+    # Strip every docstring and comment before checking; what remains is
+    # actual executable code, which is where a real leak would live.
+    code_src = src
+    try:
+        tree = ast.parse(src)
+        docstrings = [ast.get_docstring(tree, clean=False)]
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                docstrings.append(ast.get_docstring(node, clean=False))
+        for doc in docstrings:
+            if doc:
+                code_src = code_src.replace(doc, "", 1)
+        code_src = tokenize.untokenize(
+            tok for tok in tokenize.generate_tokens(io.StringIO(code_src).readline)
+            if tok.type != tokenize.COMMENT
+        )
+    except Exception as e:
+        print(f"WARNING: could not strip comments/docstrings for leakage check ({e}); scanning raw source instead.")
+        code_src = src
+
+    leaks = []
+    for label, filename, _, gt, _ in CASES:
+        # Ground-truth mm values, formatted the same ways they'd plausibly
+        # be typed as a literal (2dp, or bare like "27").
+        if gt is not None:
+            for form in (f"{gt:.2f}", f"{gt:g}"):
+                if form in code_src:
+                    leaks.append(f"{label}: ground-truth value {form!r} appears literally in pipeline.py")
+        # Filenames/labels naming a specific test photo.
+        stem = os.path.splitext(filename)[0]
+        for needle in (filename, stem, label):
+            if needle in code_src:
+                leaks.append(f"{label}: identifier {needle!r} appears in pipeline.py (looks like a per-photo special case)")
+
+    return leaks
+
+
 def run():
     rows = []
     all_pass = True
+
+    leaks = check_no_ground_truth_leakage()
+    if leaks:
+        print("FATAL: possible ground-truth / per-photo leakage into pipeline.py:")
+        for l in leaks:
+            print(f"  - {l}")
+        print("Candidate selection must not know a test photo's identity or answer.")
+        print("Fix pipeline.py (or this check, if it's a genuine false positive) before trusting any pass below.\n")
+        all_pass = False
 
     if not os.path.isdir(TEST_SET_DIR):
         print(f"FATAL: test_set directory not found at {TEST_SET_DIR}")
@@ -70,6 +154,20 @@ def run():
         t0 = time.time()
         res = measure_ring(photo)
         elapsed_ms = (time.time() - t0) * 1000
+
+        # Invariant: a supported photo returns a diameter, an unsupported/
+        # ambiguous one returns a specific reason - never both, never
+        # neither (an accepted result with no number, or a rejection with
+        # no reason, is a contract violation regardless of whether the
+        # status itself happens to match what was expected).
+        if res.ok and res.diameter_mm is None:
+            rows.append((label, expected_status, "ACCEPT", "-", "-", "-", "MALFORMED: ok=True but diameter_mm is None", f"{elapsed_ms:.0f}ms", "FAIL"))
+            all_pass = False
+            continue
+        if not res.ok and not res.reason:
+            rows.append((label, expected_status, "REJECT", "-", "-", "-", "MALFORMED: not ok but no reason code", f"{elapsed_ms:.0f}ms", "FAIL"))
+            all_pass = False
+            continue
 
         actual_status = "ACCEPT" if res.ok else "REJECT"
         diam_str = f"{res.diameter_mm:.2f}" if res.ok else "-"
