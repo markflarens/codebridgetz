@@ -1,22 +1,40 @@
-fastapi==0.141.1
-uvicorn==0.52.4
-python-multipart==0.0.32
-opencv-contrib-python==4.13.0.92
-numpy==2.4.6
-pillow==12.3.0
+# Version RANGES (not brittle exact pins) for the packages below, after a
+# real, direct failure: fastapi==0.141.1 was pinned based on this sandbox's
+# own `pip index`/`pip show` output, which has repeatedly been proven to
+# report versions that don't actually exist on real PyPI - confirmed again,
+# concretely, when a real `pip install` on a real machine failed outright
+# with "Could not find a version that satisfies the requirement
+# fastapi==0.141.1", listing real PyPI's actual latest as 0.128.8. Ranges
+# below are deliberately bounded (a floor recent enough to have the features
+# this app uses, a ceiling below the next major/breaking line) rather than
+# left completely open, so `pip install` resolves to whatever real version
+# is actually current within a known-good window instead of either
+# guessing one exact number or drifting onto a future breaking release.
+fastapi>=0.115,<0.130
+uvicorn>=0.30,<0.55
+python-multipart>=0.0.9,<0.1.0
+# opencv-contrib-python: capped below 5.0 deliberately - opencv 5.x changes
+# contour/Hough behavior enough to invalidate this pipeline's calibrated
+# thresholds (see pipeline.py's module docstring and DELIVERY_NOTES.md).
+# Confirmed concretely: `pip install opencv-contrib-python` with no pin on
+# a real machine resolved straight to 5.0.0.93.
+opencv-contrib-python>=4.9,<5.0
+numpy>=2.0,<2.5
+pillow>=11.0,<13.0
 
 # --- Ring-body segmentation (MobileSAM via ultralytics) ------------------
 # ultralytics==8.4.150 pinned exactly: verified as a real, published PyPI
 # release via web search (not trusted from this sandbox's own `pip show`,
 # which has previously been proven to report phantom not-yet-real
 # versions for fast-moving packages - see DELIVERY_NOTES for that
-# incident). torch is pinned to a RANGE rather than an exact patch version
-# for the same reason in the other direction: this sandbox has 2.14.0
+# incident, and the range rationale above for a second, now directly-
+# confirmed instance of the same problem). torch is pinned to a RANGE for
+# the same reason in the other direction: this sandbox has 2.14.0
 # installed, but only PyTorch 2.12 could be independently confirmed real
 # via web search, and a brittle exact pin that turns out not to exist yet
 # on the CPU wheel index (see Dockerfile - we install the CPU-only build,
-# not the default CUDA one) fails the whole deploy outright. A range lets
-# pip/Railway resolve to whatever real CPU build is actually published in
-# this line at build time instead of gambling on one exact guessed number.
+# not the default CUDA one) fails the whole install outright. A range lets
+# pip resolve to whatever real CPU build is actually published in this
+# line at install time instead of gambling on one exact guessed number.
 torch>=2.12,<2.15
 ultralytics==8.4.150
