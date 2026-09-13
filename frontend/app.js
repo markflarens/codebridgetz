@@ -4,9 +4,12 @@
   const screens = {};
   document.querySelectorAll("[data-screen]").forEach(el => { screens[el.id] = el; });
 
-  // Each screen has a matching fixed bottom "dock" of action button(s),
-  // shown/hidden together with it since docks live outside the scrolling
-  // screen sections (fixed position).
+  // Each screen has a matching "dock" of action button(s), shown/hidden
+  // together with it by id. Docks are plain in-flow elements (a fixed
+  // dock was tried and reverted - see style.css), and dock-instructions
+  // is nested inside screen-instructions' own markup; hiding/showing by
+  // id here still works the same either way, and is kept explicit rather
+  // than relying on a dock always being inside its screen's DOM subtree.
   const DOCK_FOR_SCREEN = {
     "screen-instructions": "dock-instructions",
     "screen-capture": "dock-capture",

@@ -184,7 +184,21 @@ async def measure(file: UploadFile = File(...)):
 
 @app.get("/api/marker")
 async def get_marker():
-    return FileResponse(MARKER_PDF_PATH, media_type="application/pdf", filename="ring_marker_20mm.pdf")
+    # Served INLINE, not as an attachment: the frontend opens this in a new
+    # tab (target="_blank", no `download` attribute) so the user can view,
+    # print, or save it with the browser's own controls rather than having
+    # it silently auto-download. `filename=` alone on Starlette's
+    # FileResponse defaults content_disposition_type to "attachment",
+    # which forces a download regardless of how the link was opened - so
+    # content_disposition_type is set explicitly here instead. `filename`
+    # is still passed so "Save As" (if the user chooses it from the PDF
+    # viewer) offers a sensible name instead of a random one.
+    return FileResponse(
+        MARKER_PDF_PATH,
+        media_type="application/pdf",
+        filename="ring_marker_20mm.pdf",
+        content_disposition_type="inline",
+    )
 
 
 # Serve the frontend static files (index.html, style.css, app.js) at "/"

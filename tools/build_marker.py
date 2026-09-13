@@ -19,7 +19,10 @@ Two bugs fixed after visual review of the first ReportLab attempt:
      bottom of the page and the marker near the top).
   2. Cyrillic text: the default Helvetica font has no Cyrillic glyphs -
      instruction text rendered as solid black boxes. Fixed by embedding
-     DejaVuSans (supports Cyrillic) via pdfmetrics.
+     DejaVuSans (supports Cyrillic) via pdfmetrics. All instruction text
+     below is now English-only (production copy requirement) - DejaVuSans
+     is kept anyway since it's already verified working and dropping it
+     for Helvetica would be an unrelated, unverified change.
 
 Run: python3 build_marker.py
 Output: ring_marker_20mm.pdf
@@ -103,11 +106,11 @@ def main():
     body_font, body_size = "DejaVuSans", 9.5
     c.setFont(body_font, body_size)
     raw_lines = [
-        "Крок 1. Друкуйте цю сторінку з масштабом 100% / Actual size. Вимкніть \"Fit to page\" / \"Scale to fit\".",
-        "Крок 2. Перевірте SCALE CHECK нижче звичайною лінійкою: квадрат має бути рівно 20х20 мм, лінійка — рівно 50.0 мм. Якщо ні — передрукуйте з правильним масштабом. НЕ фотографуйте кільце, доки це не підтверджено.",
-        "Крок 3. Виріжте ArUco-маркер по сірій пунктирній лінії (залишає біле поле навколо).",
-        "Крок 4. Покладіть маркер БІЛЯ кільця (впритул, наскільки можливо), на тому самому рівному столі, в одній площині. Що ближче маркер до кільця в кадрі, то менше впливають оптичні спотворення об'єктива на результат.",
-        "Крок 5. Сфотографуйте зверху (near-overhead): маркер і кільце чітко видні, без сильного розмиття чи нахилу камери.",
+        "Step 1. Print this page at 100% / Actual size. Turn OFF \"Fit to page\" / \"Scale to fit\".",
+        "Step 2. Check the SCALE CHECK block below with an ordinary ruler: the square must measure exactly 20x20 mm, and the ruler must measure exactly 50.0 mm. If not, reprint with the correct scale. Do NOT photograph the ring until this is confirmed.",
+        "Step 3. Cut out the ArUco marker along the gray dashed line (this leaves a white border around it).",
+        "Step 4. Place the marker NEXT TO the ring (as close as possible), on the same flat surface, in the same plane. The closer the marker is to the ring in frame, the less the camera lens' own distortion affects the result.",
+        "Step 5. Photograph from directly above (near-overhead): marker and ring both clearly visible, without heavy blur or camera tilt.",
     ]
     top = 24
     line_height = 5.2
@@ -119,7 +122,7 @@ def main():
 
     c.setFillColorRGB(0.8, 0, 0)
     c.setFont("DejaVuSans-Bold", 9.5)
-    for line in wrap_text("Похибка масштабу друку 2% -> похибка виміру кільця приблизно 2%.",
+    for line in wrap_text("A 2% print scale error means roughly a 2% error in the measured ring size.",
                           "DejaVuSans-Bold", 9.5, max_text_width_pt):
         c.drawString(15*mm, y_from_top(top+2), line)
         top += line_height
@@ -149,7 +152,7 @@ def main():
     # --- SCALE CHECK block: fully separate area of the page, own square + ruler ---
     sc_top = marker_top + MARKER_MM + cut_margin*2 + 15
     c.setFont("DejaVuSans-Bold", 10)
-    c.drawString(15*mm, y_from_top(sc_top), "SCALE CHECK (перевірте лінійкою перед друком кільця):")
+    c.drawString(15*mm, y_from_top(sc_top), "SCALE CHECK (verify with a ruler before photographing the ring):")
 
     sq_top = sc_top + 8
     sq_x0 = 15*mm
