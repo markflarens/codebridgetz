@@ -102,8 +102,16 @@ measured against this pipeline:
 
 | Photo | Caliper/ruler ground truth | Pipeline result | Abs. error |
 |---|---|---|---|
-| IMG_9783 (steel ring, mild angle) | ~17mm (ruler, coarse) | 17.07mm | — (ruler too coarse to score precisely) |
-| IMG_9784 (keyring-style ring) | 27mm (ruler) | 26.47mm | 0.53mm |
+| IMG_9784 (keyring-style ring) | 27mm (ruler) | 26.80mm | 0.20mm |
+
+IMG_9783 (steel ring, mild angle) now returns a retake
+(`RING_EDGE_UNSTABLE`): its edge-based detectors still measure it
+correctly (~17mm), but its heavily hammered band and a specular highlight
+inside the hole itself prevent the independent topological detector from
+confirming that boundary, and cross-method agreement now requires that
+independent confirmation rather than accepting on edge-based agreement
+alone - see DELIVERY_NOTES.md for the full explanation and a debug-overlay
+comparison.
 
 Six synthetic stress photos (clean, specular highlight, shadow gradient,
 low contrast, textured background, heavy blur) and one adversarial decoy

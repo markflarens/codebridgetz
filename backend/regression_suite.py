@@ -52,7 +52,30 @@ TEST_SET_DIR = os.path.normpath(os.path.join(_HERE, "..", "test_set"))
 # independently of this pipeline's own output - see the policy note
 # below), then add one row here with that filename and ground truth.
 CASES = [
-    ("real_ring_A_9783",        "real_ring_A_IMG_9783.jpg",             "ACCEPT", None,  None),
+    # Expected status changed from ACCEPT to REJECT deliberately, as a
+    # documented CONSEQUENCE of tightening the acceptance rule (see
+    # pipeline.py's has_topological_confirmation), not a bug being patched
+    # around. This ring's band is heavily hammered/textured AND has a
+    # strong specular highlight bisecting the visible hole interior itself
+    # (confirmed by inspecting the rectified crop directly): the edge-based
+    # families (canny/adaptive/otsu) still find the correct boundary and
+    # agree tightly on it, but the independent color-topology detector
+    # (enclosed_hole_candidates/"holecolor") cannot get a valid candidate
+    # at all here - the highlight splits the true hole's background-
+    # colored region into a non-convex crescent that fails the axis_ratio
+    # circularity filter, so it contributes zero candidates, not a wrong
+    # one. Per this project's explicit policy (agreement between two
+    # correlated edge families is no longer sufficient - see
+    # has_topological_confirmation's docstring), that means this photo can
+    # no longer be trusted enough to ACCEPT, even though the edge families
+    # alone would have measured it correctly (~16.5-17mm, consistent with
+    # its previously-recorded ~17mm ground truth). This is an intentional,
+    # reported trade-off - a stricter, more conservative system that
+    # refuses more real photos in exchange for never accepting on
+    # correlated-methods-agreeing-on-the-same-wrong-edge - not something to
+    # "fix" by loosening the topological requirement back down for this
+    # one photo.
+    ("real_ring_A_9783",        "real_ring_A_IMG_9783.jpg",             "REJECT", None,  None),
     ("real_ring_B_9784",        "real_ring_B_IMG_9784.jpg",             "ACCEPT", 27.0,  1.0),
     # NOT a new/unseen ring - this is the SAME photo as real_ring_B_9784
     # above, downscaled ~2.06x (3024x4032 -> 1466x1956, matching a real

@@ -143,9 +143,11 @@ Full pass/fail table, from the delivered code, `python3 backend/regression_suite
 | Synthetic wide scene (ring small in frame) | 17.40mm | rendered (exact) | ACCEPT | ACCEPT, 17.57mm | 0.17mm |
 | Synthetic decoy object (adversarial second circle) | 17.40mm | rendered (exact) | ACCEPT (ignore decoy) | ACCEPT, 17.53mm | 0.13mm |
 
-**11/11 pass** against `test_set/expected_vs_actual.csv` at delivery time.
-Every rejected case rejects for the reason the test was designed to
-trigger, not an unrelated failure.
+**11/11 pass** against `regression_suite.py`'s `CASES` at delivery time,
+including the updated expectation for Real ring A (see below - now an
+intentional REJECT, not the same "pass" as before this revision). Every
+rejected case rejects for the reason the test was designed to trigger,
+not an unrelated failure.
 
 **Detection architecture (current):** redesigned around finding the
 inner hole directly, not around scoring which circle looks "strongest."
@@ -205,6 +207,103 @@ rejected candidate with its specific rejection reason, and the final
 selected boundary, for visual auditing of exactly what the pipeline
 considered and why it picked (or didn't pick) a given edge.
 
+**Safety hardening (this revision) — five specific gaps closed, on
+request, after review of the redesign above:**
+
+1. **No more geometry-only fallback when the background can't be
+   sampled.** `validate_material_contrast` used to SKIP its own check
+   (return "passed") when `sample_background_reference` came back `None`
+   (e.g. ring+marker filling nearly the whole frame) - silently reopening
+   exactly the "accept on geometry alone" failure mode the whole redesign
+   exists to close, for that one edge case. `measure_ring` now checks for
+   this immediately and returns a dedicated retake reason,
+   `BACKGROUND_REFERENCE_UNAVAILABLE`, before any candidate is even
+   generated; `validate_material_contrast` itself now rejects (not skips)
+   on a missing reference too, as a defensive second layer.
+2. **The center-agreement tolerance was NOT loosened to fit one photo.**
+   An earlier version of this file raised `CENTER_AGREEMENT_THRESHOLD_MM`
+   from 2.0mm to 3.0mm specifically because Real ring B showed a ~2.5mm
+   `holecolor`-vs-`canny` center gap - textbook per-photo tolerance
+   tuning, which this project's own policy forbids. Investigated instead:
+   the cause was `sample_background_reference` using a single whole-frame
+   background estimate, which under uneven real-world lighting can
+   mismatch the wood color *right around the ring*, causing
+   `enclosed_hole_candidates`'s background-color segmentation to be
+   asymmetric and its fitted center to drift. Fixed at the source (see
+   #3) and the threshold reverted to 2.0mm - the value already validated
+   (not discovered by tuning) against the adversarial-decoy case.
+3. **Background is now sampled locally, near the ring, not just
+   globally.** `sample_background_reference` now prefers an annulus
+   sampled just outside the localized ring (falling back to the old
+   whole-frame estimate only if that annulus is too small/unavailable) -
+   because a table's wood grain and lighting are not uniform across a
+   whole photo, and what the material-contrast gate and the hole detector
+   actually need is what "background" looks like immediately around the
+   ring, not an average pulled off by a corner of the frame nowhere near
+   it. This is also what made #2's fix possible without loosening
+   anything.
+4. **ACCEPT now requires the topological detector, not just any two edge
+   methods.** Canny/adaptive/Otsu (and the radial fallback, which
+   inherits its variant's family name) are all gradient/edge-based
+   methods derived from the same grayscale image - this file already
+   documents them failing together in the same direction (the dilate-bias
+   bug: all 4 Canny variants wrong the same way at once). Two of them
+   agreeing was previously enough for cross-family consensus, but that is
+   not independent confirmation - it can be the same underlying mistake
+   counted twice. A cluster can now only ACCEPT if it contains `holecolor`
+   (the connected-component/color-topology detector) together with at
+   least one edge-based family; edge-only agreement, however tight, no
+   longer qualifies. Real ring B still accepts under this rule at
+   26.80mm (0.20mm error vs. 27.00mm ground truth - tighter than before,
+   from the local-background fix in #3). **Real ring A now correctly
+   RETAKEs** - see the dedicated note below; this is a reported
+   consequence of the stricter rule, not a bug.
+5. Two supporting fixes were needed to make #3/#4 actually work rather
+   than just rejecting everything: (a) `locate_outer_ring_circle`'s Hough
+   search used to require its own circle to show smaller nested
+   structure, which fails on a clean/high-contrast photo where the INNER
+   hole is the single most prominent circle (there's nothing smaller
+   nested inside it) - it now falls back to the largest plausible Hough
+   circle when nothing validates, and `measure_ring` cross-checks/expands
+   that radius against the independent contour candidates it already
+   computes, so downstream localization isn't silently undersized. (b)
+   The interior-background match itself is now judged by CHROMA (Lab
+   a*/b*) plus a *bounded* brightness allowance rather than one combined
+   brightness+chroma distance: a ring physically shadows its own hole, so
+   what's visible through a genuine hole is often legitimately darker
+   than the open table beside the ring without being a different surface
+   at all - an earlier attempt to fix this by ignoring darkness entirely
+   turned out to be wrong (it also let an achromatic ring band pass as
+   "background" whenever the band and the background were both close to
+   gray, differing mainly in brightness), so darker is tolerated only up
+   to a fixed, generous-but-finite bound
+   (`max_interior_darkness_z=6.0`), reasoned from the largest genuine
+   self-shadow effect actually observed, then checked against the whole
+   suite as a fixed rule.
+
+**Real ring A: a known, reported, and deliberate new REJECT.** Inspecting
+the rectified crop directly (not just the numbers) shows why: this ring's
+band is heavily hammered/textured, and the hole interior itself has a
+strong specular highlight cutting across it. The edge-based families
+still find the true boundary and agree tightly (canny/adaptive/otsu all
+converge on ~16.5-17mm, matching this ring's previously-recorded ~17mm
+ground truth, confirmed visually - the debug overlay's colored rings sit
+right on the true inner edge). But `enclosed_hole_candidates` cannot
+produce ANY valid candidate here: the highlight splits the hole's
+background-colored region into a non-convex crescent that fails the
+circularity filter, contributing zero candidates rather than a wrong one.
+Under rule #4 above, edge-only agreement is no longer sufficient, so this
+photo now returns `RING_EDGE_UNSTABLE` instead of a measurement.
+`regression_suite.py`'s expected outcome for this case was updated to
+`REJECT` to match, with a comment explaining exactly this - not loosened
+back down to force it to ACCEPT again. This is the real, visible
+trade-off of requiring independent topological confirmation: a real
+photo that a human could measure correctly by eye, and that the edge
+methods DID measure correctly, is now refused because one specific
+detection strategy couldn't independently confirm it. Reported as-is,
+per instruction, rather than hidden by re-loosening rule #4 for this one
+case.
+
 ### Observed failures and limitations
 
 - **Real-ring diversity is thin (2 real rings).** Both currently-passing
@@ -249,8 +348,13 @@ considered and why it picked (or didn't pick) a given edge.
   closed-contour detector often can't get a clean boundary on a
   reflective ring at all (0 of 6 segmentation variants produced a closed
   contour on Real ring B in testing); the radial-histogram fallback that
-  handles this is real but coarser (cross-method spread 0.53–0.8mm on
-  real photos vs. ~0.04mm on clean synthetic renders).
+  handles this is real but coarser (cross-method spread 0.20–0.8mm on
+  real photos vs. ~0.04mm on clean synthetic renders). Heavy hammered
+  texture combined with a specular highlight bisecting the hole interior
+  can additionally defeat the independent topological (`holecolor`)
+  confirmation entirely (see Real ring A above) even when the edge-based
+  methods still measure correctly - this is now a documented REJECT
+  case, not silently accepted on edge-agreement alone.
   A **wrong-but-confident** fix for one specific low-contrast reflective
   photo was found, verified to be wrong (23.47mm vs 27mm ground truth by
   directly downscaling the same validated photo), and reverted rather
