@@ -1,5 +1,11 @@
 # Gauge — Ring Diameter Measurement
 
+**Submission details** (AI tools/models used, exact runtime stack, reused
+vs. custom code, reproducible test set with independently recorded ground
+truth, expected vs. actual per image, dev time, processing time, cost
+breakdown, and a concrete example of how AI-generated output was
+independently checked) are in **[DELIVERY_NOTES.md](DELIVERY_NOTES.md)**.
+
 Mobile-friendly web app that measures a ring's internal diameter from a
 photo, using a printed 20mm calibration marker for scale. No manual
 diameter entry, no manual scale calibration.

@@ -47,7 +47,7 @@ RETAKE_MESSAGES = {
     "PERSPECTIVE_TOO_HIGH": "Too much perspective. Take the photo more directly from above.",
     "BLUR": "Photo is too blurry. Hold the phone steady and retake.",
     "UNDEREXPOSED": "Photo is too dark. Move to a brighter area and retake.",
-    "OVEREXPOSED": "Photo is too bright or washed out. Reduce glare and retake in more even light.",
+    "OVEREXPOSED": "Photo is too bright or reflective. Use softer, more even light and avoid direct reflections on the ring or marker, then retake.",
     "RING_NOT_FOUND": "Ring edge is unclear. Avoid reflections and place the ring on a contrasting surface.",
     "RING_EDGE_UNSTABLE": "Ring edge is unclear. Avoid reflections and place the ring on a contrasting surface.",
     "INCONSISTENT_DETECTION": "Detected more than one possible circular object. Make sure only one ring is in the photo, away from other round objects.",

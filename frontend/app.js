@@ -144,10 +144,17 @@
     const flag = document.getElementById("reading-size-flag");
     flag.textContent = data.ring_size_in_range ? "" : "outside standard US finger-ring range";
 
-    document.getElementById("data-spread").textContent = `± ${data.detection_spread_mm.toFixed(2)} mm`;
+    // No "±" here on purpose: this number is cross-METHOD disagreement
+    // (see the disclosure below it), not a physical measurement
+    // uncertainty/error bar - the ± symbol implies the latter.
+    document.getElementById("data-spread").textContent = `Spread: ${data.detection_spread_mm.toFixed(2)} mm`;
 
-    const methods = Object.keys(data.family_estimates || {});
+    const familyEstimates = data.family_estimates || {};
+    const methods = Object.keys(familyEstimates);
     document.getElementById("data-methods").textContent = `${methods.length}`;
+    document.getElementById("data-family-estimates").textContent = methods.length
+      ? methods.map(name => `${name}: ${familyEstimates[name].toFixed(2)} mm`).join("  ·  ")
+      : "";
 
     document.getElementById("data-time").textContent = `${(data.processing_time_ms / 1000).toFixed(1)} s`;
     document.getElementById("data-standard").textContent = data.sizing_standard;

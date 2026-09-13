@@ -56,6 +56,18 @@
     </ol>
 
     <p class="fine-note">Works with one ring + one marker, laid flat, shot from overhead.</p>
+
+    <details class="disclosure disclosure--block">
+      <summary>Supported conditions &amp; limitations</summary>
+      <ul>
+        <li>Exactly one ring and one calibration marker in the photo.</li>
+        <li>Ring and marker must lie flat, on the same plane/surface.</li>
+        <li>The marker must be fully visible — not cropped or covered.</li>
+        <li>Photo should be taken near-overhead (not at a steep angle).</li>
+        <li>The ring's inner opening must be clearly visible (nothing inside it).</li>
+        <li>Avoid: blur, strong reflections/glare, very dark photos, and excessive perspective distortion.</li>
+      </ul>
+    </details>
   </section>
 
   <div class="dock dock--stack" id="dock-instructions">
@@ -141,32 +153,34 @@
 
     <div class="datagrid">
       <div class="datagrid__cell">
-        <span class="datagrid__label">Spread</span>
+        <span class="datagrid__label">Cross-method spread</span>
         <span class="datagrid__value" id="data-spread">—</span>
       </div>
       <div class="datagrid__cell">
-        <span class="datagrid__label">Methods</span>
-        <span class="datagrid__value" id="data-methods">—</span>
-      </div>
-      <div class="datagrid__cell">
-        <span class="datagrid__label">Time</span>
+        <span class="datagrid__label">Processing time</span>
         <span class="datagrid__value" id="data-time">—</span>
       </div>
-      <div class="datagrid__cell">
-        <span class="datagrid__label">Standard</span>
+      <div class="datagrid__cell datagrid__cell--wide">
+        <span class="datagrid__label">Sizing standard</span>
         <span class="datagrid__value datagrid__value--small" id="data-standard">—</span>
       </div>
     </div>
 
-    <details class="disclosure">
-      <summary>What "spread" means</summary>
-      <p>How much independent detection methods disagreed — a stability signal, not a full accuracy estimate.</p>
+    <details class="disclosure disclosure--block">
+      <summary>What "cross-method spread" means</summary>
+      <p>Cross-method spread is how much independent detection methods disagreed with each other on the same photo. It is <strong>not</strong> a physical measurement uncertainty (it says nothing about printer scale error, lens distortion, or marker-corner localization error). A low spread means the methods agree; it is a stability signal, not an accuracy guarantee.</p>
     </details>
 
-    <details class="disclosure">
-      <summary>Sizing source</summary>
+    <details class="disclosure disclosure--block">
+      <summary>Sizing source &amp; rounding rule</summary>
       <p id="data-source"></p>
       <p id="data-rounding"></p>
+    </details>
+
+    <details class="disclosure disclosure--block">
+      <summary>Measurement details (technical)</summary>
+      <p>Number of independent detection methods that agreed: <span id="data-methods">—</span>.</p>
+      <p id="data-family-estimates" class="mono-small"></p>
     </details>
   </section>
 

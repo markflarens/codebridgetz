@@ -457,6 +457,7 @@ main#app {
   font-variant-numeric: tabular-nums;
 }
 .datagrid__value--small { font-family: var(--font); font-size: 11.5px; line-height: 1.4; }
+.datagrid__cell--wide { grid-column: 1 / -1; }
 
 .disclosure {
   border-bottom: 1px solid var(--line-soft);
@@ -480,6 +481,25 @@ main#app {
   color: var(--text-dim);
   line-height: 1.55;
   font-size: 11.5px;
+}
+.disclosure ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--text-dim);
+  line-height: 1.55;
+  font-size: 11.5px;
+}
+.disclosure ul li { margin: 3px 0; }
+/* Same look as the result-screen disclosures, used on the instructions
+   screen too (limitations list) - kept as a separate modifier rather than
+   changing .disclosure itself, since .disclosure elsewhere relies on the
+   border-bottom + divider-list look inside the result screen's stack. */
+.disclosure--block { border-bottom: none; }
+.mono-small {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.6;
 }
 
 /* ---------- result: retake ---------- */
